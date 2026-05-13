@@ -14,12 +14,11 @@ tmp/
 *.sqlite
 *.sqlite3
 *.log
-publisher
-publisher.exe
+/publisher
+/publisher.exe
 
 # Go build and test output
 bin/
 dist/
 coverage.out
 *.test
-
