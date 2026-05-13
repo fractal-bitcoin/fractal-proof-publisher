@@ -1,0 +1,17 @@
+services:
+  publisher:
+    build:
+      context: .
+    image: fractal-proof-publisher:local
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    command: ["run"]
+    environment:
+      PUBLISHER_CONFIG: /app/config/config.json
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "snode:host-gateway"

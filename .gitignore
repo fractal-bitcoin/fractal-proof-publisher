@@ -1,0 +1,25 @@
+.DS_Store
+
+# Local configuration and secrets
+config.json
+*.local.json
+.env
+.env.*
+
+# Runtime state
+data/
+tmp/
+.tmp-*/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+publisher
+publisher.exe
+
+# Go build and test output
+bin/
+dist/
+coverage.out
+*.test
+

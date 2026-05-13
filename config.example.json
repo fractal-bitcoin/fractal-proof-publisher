@@ -1,0 +1,63 @@
+{
+  "bitcoin_rpc": {
+    "url": "http://snode:10032",
+    "user": "REPLACE_RPC_USER",
+    "password": "REPLACE_RPC_PASSWORD",
+    "network": "mainnet"
+  },
+  "signing": {
+    "private_key_wif": "REPLACE_PRIVATE_KEY_WIF",
+    "change_address": "REPLACE_CHANGE_ADDRESS",
+    "initial_utxos": [
+      {
+        "txid": "REPLACE_TXID",
+        "vout": 0,
+        "amount_sat": 100000,
+        "address": "REPLACE_UTXO_ADDRESS",
+        "script_pub_key": "REPLACE_SCRIPT_PUB_KEY",
+        "address_type": "p2wpkh"
+      }
+    ]
+  },
+  "state_api": {
+    "base_url": "http://host.docker.internal:8000",
+    "timeout": 5000000000,
+    "auth": "",
+    "provider": "query-fip101"
+  },
+  "fee_api": {
+    "timeout": 5000000000,
+    "strategy": "minimum",
+    "min_fee_rate_sat_vb": 1,
+    "max_fee_rate_sat_vb": 1,
+    "fixed_fee_rate_sat_vb": 1
+  },
+  "register": {
+    "index_ratio_bp": 100,
+    "reward_addr_type": "p2wpkh",
+    "reward_addr": "REPLACE_REWARD_ADDRESS",
+    "name": "REPLACE_INDEXER_NAME",
+    "indexer_id": "REPLACE_EXISTING_INDEXER_ID_OR_EMPTY"
+  },
+  "scan": {
+    "start_height": 42450,
+    "poll_interval": 3000000000,
+    "target_block_version": 539361536,
+    "required_confirmations": 1,
+    "max_reorg_depth": 6
+  },
+  "tx": {
+    "send_change_min_value": 546
+  },
+  "database": {
+    "sqlite_path": "/app/data/publisher.db"
+  },
+  "runtime": {
+    "mode": "default",
+    "unisat_open_api_url": "https://open-api.unisat.io",
+    "unisat_open_api_key": "REPLACE_UNISAT_OPEN_API_KEY",
+    "dry_run": false,
+    "disable_broadcast": false,
+    "health_addr": ":8080"
+  }
+}

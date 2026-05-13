@@ -1,0 +1,14 @@
+.git
+.DS_Store
+.gocache
+config.json
+*.local.json
+data
+publisher-regtest.db
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.tmp-*
+tmp
+testdata
