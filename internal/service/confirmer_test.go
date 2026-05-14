@@ -339,6 +339,65 @@ func TestConfirmOnceSkipsWaitingForConfirmationInUnisatMode(t *testing.T) {
 	}
 }
 
+func TestConfirmOnceWaitsForUnisatCommitVisibilityBeforeReveal(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "unisat-commit-wait.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "abcd", "ef01", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "committxid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+
+	var revealPushCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/indexer/tx/"):
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			revealPushCount++
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusCommitSent {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusCommitSent)
+	}
+	if message.RevealBroadcastAt != "" {
+		t.Fatalf("reveal broadcast at = %q, want empty", message.RevealBroadcastAt)
+	}
+	if revealPushCount != 0 {
+		t.Fatalf("reveal push count = %d, want 0", revealPushCount)
+	}
+}
+
 func TestConfirmOnceRebroadcastsRevealWhenUnisatTxNotVisible(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "unisat-reveal-wait.db")
 	s, err := store.Open(dbPath)

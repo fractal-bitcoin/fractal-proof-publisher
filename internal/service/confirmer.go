@@ -68,7 +68,22 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 
 			case model.MessageStatusCommitSent:
 				if e.isUnisatOpenAPIMode() {
-					e.LogMessagef(message, "commit_confirm_skipped reason=unisat_open_api_mode")
+					if e.UnisatOpenAPI == nil || strings.TrimSpace(message.TxID) == "" {
+						advanced = false
+						break
+					}
+					found, err := e.UnisatOpenAPI.HasTx(ctx, message.TxID)
+					if err != nil {
+						e.LogMessagef(message, "commit_confirm_check_failed err=%v", err)
+						advanced = false
+						break
+					}
+					if !found {
+						e.LogMessagef(message, "commit_confirm_waiting reason=unisat_tx_not_visible")
+						advanced = false
+						break
+					}
+					e.LogMessagef(message, "commit_confirmed_detected source=unisat_open_api")
 					if err := e.Store.MarkMessageConfirmed(ctx, message.ID, message.RelatedHeight); err != nil {
 						return err
 					}

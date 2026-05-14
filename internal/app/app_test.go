@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -9,11 +10,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"fractal-proof-publisher/internal/config"
 	"fractal-proof-publisher/internal/keys"
+	"fractal-proof-publisher/internal/model"
 	"fractal-proof-publisher/internal/store"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -322,5 +325,73 @@ func TestStartHealthServer(t *testing.T) {
 	}
 	if status.LastSeenTip != "42458" {
 		t.Fatalf("/status last_seen_tip = %q, want 42458", status.LastSeenTip)
+	}
+}
+
+func TestMessageRebuildAdminEndpointResetsMessageOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	if err := s.SetChainState(ctx, "last_scanned_height", "1764271"); err != nil {
+		t.Fatalf("SetChainState(last_scanned_height) error = %v", err)
+	}
+	height := uint64(1764241)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commitraw", "revealraw", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18091", s, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18091/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(messageID, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 200", resp.StatusCode, string(body))
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusBuilding {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusBuilding)
+	}
+	if message.RawTxHex != "" || message.RevealRawTxHex != "" || message.RevealTxID != "" {
+		t.Fatalf("signed tx fields were not cleared: raw=%q reveal_raw=%q reveal_txid=%q", message.RawTxHex, message.RevealRawTxHex, message.RevealTxID)
+	}
+	lastScanned, err := s.GetChainState(ctx, "last_scanned_height")
+	if err != nil {
+		t.Fatalf("GetChainState(last_scanned_height) error = %v", err)
+	}
+	if lastScanned != "1764271" {
+		t.Fatalf("last_scanned_height = %q, want unchanged 1764271", lastScanned)
 	}
 }

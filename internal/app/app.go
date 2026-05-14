@@ -31,6 +31,27 @@ type statusResponse struct {
 	LastSeenTip          string `json:"last_seen_tip,omitempty"`
 }
 
+type messageRebuildRequest struct {
+	MessageID int64 `json:"message_id"`
+}
+
+type messageRebuildResponse struct {
+	OK        bool                `json:"ok"`
+	MessageID int64               `json:"message_id"`
+	Previous  messageStateSummary `json:"previous"`
+}
+
+type messageStateSummary struct {
+	Type       model.MessageType   `json:"type"`
+	Status     model.MessageStatus `json:"status"`
+	Height     uint64              `json:"height,omitempty"`
+	IndexerID  string              `json:"indexer_id,omitempty"`
+	TxID       string              `json:"txid,omitempty"`
+	RevealTxID string              `json:"reveal_txid,omitempty"`
+	RevealSent bool                `json:"reveal_sent"`
+	RevealDone bool                `json:"reveal_done"`
+}
+
 func Run(ctx context.Context, cfg config.Config) error {
 	return RunMode(ctx, cfg, "run")
 }
@@ -181,6 +202,51 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, mode st
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+	mux.HandleFunc("/admin/message/rebuild", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req messageRebuildRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		if req.MessageID <= 0 {
+			http.Error(w, "message_id must be greater than 0", http.StatusBadRequest)
+			return
+		}
+
+		message, err := s.GetMessage(ctx, req.MessageID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("get message: %v", err), http.StatusNotFound)
+			return
+		}
+		if !isRebuildableMessageStatus(message.Status) {
+			http.Error(w, fmt.Sprintf("message status %s cannot be rebuilt", message.Status), http.StatusConflict)
+			return
+		}
+
+		updated, err := s.ResetMessageToBuilding(ctx, req.MessageID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("reset message: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if !updated {
+			http.Error(w, fmt.Sprintf("message %d not found", req.MessageID), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(messageRebuildResponse{
+			OK:        true,
+			MessageID: req.MessageID,
+			Previous:  summarizeMessageState(message),
+		})
+	})
 
 	server := &http.Server{
 		Addr:    addr,
@@ -204,6 +270,28 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, mode st
 	}()
 
 	return nil
+}
+
+func isRebuildableMessageStatus(status model.MessageStatus) bool {
+	switch status {
+	case model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed:
+		return true
+	default:
+		return false
+	}
+}
+
+func summarizeMessageState(message store.MessageRecord) messageStateSummary {
+	return messageStateSummary{
+		Type:       message.Type,
+		Status:     message.Status,
+		Height:     message.RelatedHeight,
+		IndexerID:  message.IndexerID,
+		TxID:       message.TxID,
+		RevealTxID: message.RevealTxID,
+		RevealSent: message.RevealBroadcastAt != "",
+		RevealDone: message.RevealConfirmHeight != 0,
+	}
 }
 
 func runLoopOnce(ctx context.Context, engine *service.Engine) error {
