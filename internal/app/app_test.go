@@ -14,9 +14,13 @@ import (
 	"testing"
 	"time"
 
+	"fractal-proof-publisher/internal/bitcoinrpc"
 	"fractal-proof-publisher/internal/config"
+	"fractal-proof-publisher/internal/feeapi"
 	"fractal-proof-publisher/internal/keys"
 	"fractal-proof-publisher/internal/model"
+	"fractal-proof-publisher/internal/service"
+	"fractal-proof-publisher/internal/stateapi"
 	"fractal-proof-publisher/internal/store"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -213,6 +217,63 @@ func TestEnsureRegisteredUsesConfiguredIndexerID(t *testing.T) {
 	}
 	if indexerID != "42457:2" {
 		t.Fatalf("indexer_id = %q, want 42457:2", indexerID)
+	}
+}
+
+func TestRunLoopOnceSkipsScanWhenProveIsPending(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pending-prove.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	if err := s.SetChainState(ctx, "indexer_id", "100:1"); err != nil {
+		t.Fatalf("SetChainState(indexer_id) error = %v", err)
+	}
+	pendingHeight := uint64(100)
+	if _, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &pendingHeight, "100:1"); err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "getblockcount" {
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":101,"error":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store:    s,
+		RPC:      bitcoinrpc.New(rpcServer.URL, "", ""),
+		FeeAPI:   feeapi.New(rpcServer.URL, time.Second),
+		StateAPI: stateapi.New(rpcServer.URL, "", time.Second, ""),
+		Config: config.Config{
+			Scan: config.ScanConfig{StartHeight: 101, TargetBlockVersion: 539361536, RequiredConfirmations: 1},
+		},
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 0 {
+		t.Fatalf("getblockcount calls = %d, want 0 when pending prove blocks scan", getBlockCountCalls)
+	}
+	existingID, err := s.FindMessageByHeightAndType(ctx, 101, model.MessageTypeProve)
+	if err != nil {
+		t.Fatalf("FindMessageByHeightAndType() error = %v", err)
+	}
+	if existingID != 0 {
+		t.Fatalf("prove at height 101 id = %d, want 0", existingID)
 	}
 }
 

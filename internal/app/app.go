@@ -302,6 +302,23 @@ func runLoopOnce(ctx context.Context, engine *service.Engine) error {
 	if err := ensureRegistered(ctx, engine); err != nil {
 		return err
 	}
+	pendingProve, err := engine.Store.GetLatestMessageByType(
+		ctx,
+		model.MessageTypeProve,
+		model.MessageStatusBuilding,
+		model.MessageStatusCommitSigned,
+		model.MessageStatusCommitSent,
+		model.MessageStatusCommitConfirmed,
+		model.MessageStatusRevealSent,
+	)
+	if err != nil {
+		return err
+	}
+	if pendingProve.ID != 0 {
+		engine.Logf("scan_skip_pending_prove message_id=%d status=%s height=%d", pendingProve.ID, pendingProve.Status, pendingProve.RelatedHeight)
+		engine.Logf("loop_done")
+		return nil
+	}
 	if err := engine.ScanOnce(ctx); err != nil {
 		return err
 	}

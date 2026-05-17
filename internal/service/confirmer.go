@@ -5,15 +5,27 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"fractal-proof-publisher/internal/model"
 )
+
+const progressRetryDelay = 3 * time.Second
 
 func (e *Engine) ConfirmOnce(ctx context.Context) error {
 	return e.ProgressOnce(ctx)
 }
 
 func (e *Engine) ProgressOnce(ctx context.Context) error {
+	if !e.ProgressRetryAt.IsZero() {
+		now := time.Now()
+		if now.Before(e.ProgressRetryAt) {
+			e.Logf("progress_retry_wait remaining=%s", e.ProgressRetryAt.Sub(now).Round(time.Millisecond))
+			return nil
+		}
+		e.ProgressRetryAt = time.Time{}
+	}
+
 	pending, err := e.Store.ListMessagesByStatus(ctx,
 		model.MessageStatusBuilding,
 		model.MessageStatusCommitSigned,
@@ -37,6 +49,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				signed, err := e.BuildAndSign(ctx, message.ID, message.PayloadText)
 				if err != nil {
 					e.LogMessagef(message, "build_sign_failed err=%v", err)
+					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
 					advanced = false
 					break
 				}
@@ -58,6 +71,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastSigned(ctx, message.ID, message.RawTxHex)
 				if err != nil {
 					e.LogMessagef(message, "commit_broadcast_failed err=%v", err)
+					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
 					advanced = false
 					break
 				}
@@ -150,6 +164,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastReveal(ctx, message.ID)
 				if err != nil {
 					e.LogMessagef(message, "reveal_broadcast_failed err=%v", err)
+					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
 					advanced = false
 					break
 				}
@@ -168,6 +183,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					found, err := e.UnisatOpenAPI.HasTx(ctx, message.RevealTxID)
 					if err != nil {
 						e.LogMessagef(message, "reveal_confirm_check_failed err=%v", err)
+						e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
 						advanced = false
 						break
 					}
@@ -176,6 +192,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 						txid, err := e.BroadcastReveal(ctx, message.ID)
 						if err != nil {
 							e.LogMessagef(message, "reveal_rebroadcast_failed err=%v", err)
+							e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
 							advanced = false
 							break
 						}
@@ -245,6 +262,10 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 			if !advanced {
 				break
 			}
+		}
+		if message.Type == model.MessageTypeProve && message.Status != model.MessageStatusDone {
+			e.LogMessagef(message, "progress_blocking_next_prove status=%s", message.Status)
+			break
 		}
 	}
 	return nil

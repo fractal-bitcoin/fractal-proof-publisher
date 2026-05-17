@@ -95,6 +95,59 @@ func TestConfirmProveWritesRevealAuditContext(t *testing.T) {
 	}
 }
 
+func TestProgressOnceBlocksLaterProvesAndBacksOffAfterFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "progress-prove-backoff.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	firstHeight := uint64(100)
+	secondHeight := uint64(101)
+	if _, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload-1", &firstHeight, "100:1"); err != nil {
+		t.Fatalf("CreateMessage(first) error = %v", err)
+	}
+	if _, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload-2", &secondHeight, "100:1"); err != nil {
+		t.Fatalf("CreateMessage(second) error = %v", err)
+	}
+
+	var availableUTXORequests int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/available-utxo-data") {
+			availableUTXORequests++
+			http.Error(w, `{"code":-2005,"msg":"exceeds rate limit","data":null}`, http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "", time.Second),
+		Config: config.Config{
+			Runtime: config.RuntimeConfig{Mode: "unisat_open_api"},
+			Signing: config.SigningConfig{ChangeAddress: "bc1q5frpw95scqqugqfxqtsdf5970k0apx63yju6xx"},
+		},
+	}
+
+	if err := engine.ProgressOnce(ctx); err != nil {
+		t.Fatalf("ProgressOnce() error = %v", err)
+	}
+	if availableUTXORequests != 1 {
+		t.Fatalf("available UTXO requests = %d, want 1", availableUTXORequests)
+	}
+
+	if err := engine.ProgressOnce(ctx); err != nil {
+		t.Fatalf("ProgressOnce() immediate retry error = %v", err)
+	}
+	if availableUTXORequests != 1 {
+		t.Fatalf("available UTXO requests after immediate retry = %d, want 1", availableUTXORequests)
+	}
+}
+
 func TestConfirmOnceUpdatesRegisterIndexerIDAfterRevealConfirmation(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "confirm.db")
 	s, err := store.Open(dbPath)
