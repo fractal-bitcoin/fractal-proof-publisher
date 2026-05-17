@@ -11,6 +11,33 @@ import (
 )
 
 const progressRetryDelay = 3 * time.Second
+const progressRetryThreshold = 10
+const revealCommitInputsSpentError = "bad-txns-inputs-missingorspent"
+
+func (e *Engine) markProgressFailure() {
+	e.ProgressErrCount++
+	if e.ProgressErrCount >= progressRetryThreshold {
+		e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+		e.Logf(
+			"progress_retry_scheduled failures=%d threshold=%d delay=%s",
+			e.ProgressErrCount,
+			progressRetryThreshold,
+			progressRetryDelay,
+		)
+		e.ProgressErrCount = 0
+	}
+}
+
+func (e *Engine) clearProgressFailures() {
+	e.ProgressErrCount = 0
+}
+
+func isCommitInputsMissingOrSpent(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), revealCommitInputsSpentError)
+}
 
 func (e *Engine) ConfirmOnce(ctx context.Context) error {
 	return e.ProgressOnce(ctx)
@@ -20,7 +47,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 	if !e.ProgressRetryAt.IsZero() {
 		now := time.Now()
 		if now.Before(e.ProgressRetryAt) {
-			e.Logf("progress_retry_wait remaining=%s", e.ProgressRetryAt.Sub(now).Round(time.Millisecond))
+			e.Logf("progress_retry_wait remaining=%s threshold=%d", e.ProgressRetryAt.Sub(now).Round(time.Millisecond), progressRetryThreshold)
 			return nil
 		}
 		e.ProgressRetryAt = time.Time{}
@@ -49,10 +76,11 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				signed, err := e.BuildAndSign(ctx, message.ID, message.PayloadText)
 				if err != nil {
 					e.LogMessagef(message, "build_sign_failed err=%v", err)
-					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+					e.markProgressFailure()
 					advanced = false
 					break
 				}
+				e.clearProgressFailures()
 				message.RawTxHex = signed
 				message.Status = model.MessageStatusCommitSigned
 				e.LogMessagef(message, "build_sign_succeeded next_status=%s", message.Status)
@@ -63,7 +91,11 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					advanced = false
 					break
 				}
-				if !e.Config.Runtime.DisableBroadcast && e.RPC == nil {
+				if !e.Config.Runtime.DisableBroadcast && !e.isUnisatOpenAPIMode() && e.RPC == nil {
+					advanced = false
+					break
+				}
+				if !e.Config.Runtime.DisableBroadcast && e.isUnisatOpenAPIMode() && e.UnisatOpenAPI == nil {
 					advanced = false
 					break
 				}
@@ -71,10 +103,11 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastSigned(ctx, message.ID, message.RawTxHex)
 				if err != nil {
 					e.LogMessagef(message, "commit_broadcast_failed err=%v", err)
-					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+					e.markProgressFailure()
 					advanced = false
 					break
 				}
+				e.clearProgressFailures()
 				message.TxID = txid
 				message.Status = model.MessageStatusCommitSent
 				e.LogMessagef(message, "commit_broadcast_succeeded next_status=%s", message.Status)
@@ -89,9 +122,11 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					found, err := e.UnisatOpenAPI.HasTx(ctx, message.TxID)
 					if err != nil {
 						e.LogMessagef(message, "commit_confirm_check_failed err=%v", err)
+						e.markProgressFailure()
 						advanced = false
 						break
 					}
+					e.clearProgressFailures()
 					if !found {
 						e.LogMessagef(message, "commit_confirm_waiting reason=unisat_tx_not_visible")
 						advanced = false
@@ -164,10 +199,25 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastReveal(ctx, message.ID)
 				if err != nil {
 					e.LogMessagef(message, "reveal_broadcast_failed err=%v", err)
-					e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+					if e.isUnisatOpenAPIMode() && isCommitInputsMissingOrSpent(err) {
+						rolledBack, rbErr := e.Store.RollbackMessageToCommitSigned(ctx, message.ID)
+						if rbErr != nil {
+							return rbErr
+						}
+						if rolledBack {
+							message.Status = model.MessageStatusCommitSigned
+							message.TxID = ""
+							message.ConfirmHeight = 0
+							message.RevealBroadcastAt = ""
+							message.RevealConfirmHeight = 0
+							e.LogMessagef(message, "reveal_broadcast_rollback_to_commit_signed reason=%s", revealCommitInputsSpentError)
+						}
+					}
+					e.markProgressFailure()
 					advanced = false
 					break
 				}
+				e.clearProgressFailures()
 				message.RevealTxID = txid
 				message.RevealBroadcastAt = "sent"
 				message.Status = model.MessageStatusRevealSent
@@ -183,19 +233,21 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					found, err := e.UnisatOpenAPI.HasTx(ctx, message.RevealTxID)
 					if err != nil {
 						e.LogMessagef(message, "reveal_confirm_check_failed err=%v", err)
-						e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+						e.markProgressFailure()
 						advanced = false
 						break
 					}
+					e.clearProgressFailures()
 					if !found {
 						e.LogMessagef(message, "reveal_confirm_waiting reason=unisat_tx_not_visible retry_push=true")
 						txid, err := e.BroadcastReveal(ctx, message.ID)
 						if err != nil {
 							e.LogMessagef(message, "reveal_rebroadcast_failed err=%v", err)
-							e.ProgressRetryAt = time.Now().Add(progressRetryDelay)
+							e.markProgressFailure()
 							advanced = false
 							break
 						}
+						e.clearProgressFailures()
 						message.RevealTxID = txid
 						message.RevealBroadcastAt = "sent"
 						e.LogMessagef(message, "reveal_rebroadcast_succeeded txid=%s", txid)
@@ -263,7 +315,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				break
 			}
 		}
-		if message.Type == model.MessageTypeProve && message.Status != model.MessageStatusDone {
+		if message.Type == model.MessageTypeProve && message.Status != model.MessageStatusDone && !e.ProgressRetryAt.IsZero() {
 			e.LogMessagef(message, "progress_blocking_next_prove status=%s", message.Status)
 			break
 		}

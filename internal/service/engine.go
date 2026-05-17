@@ -27,6 +27,7 @@ type Engine struct {
 	KeyMaterial      keys.KeyMaterial
 	UsedOpenAPIUTXOs map[string]struct{}
 	ProgressRetryAt  time.Time
+	ProgressErrCount int
 }
 
 type UnisatOpenAPIClient struct {

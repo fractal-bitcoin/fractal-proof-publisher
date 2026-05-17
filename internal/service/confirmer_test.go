@@ -95,7 +95,7 @@ func TestConfirmProveWritesRevealAuditContext(t *testing.T) {
 	}
 }
 
-func TestProgressOnceBlocksLaterProvesAndBacksOffAfterFailure(t *testing.T) {
+func TestProgressOnceBlocksLaterProvesAndBacksOffAfterTenFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "progress-prove-backoff.db")
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -133,18 +133,20 @@ func TestProgressOnceBlocksLaterProvesAndBacksOffAfterFailure(t *testing.T) {
 		},
 	}
 
-	if err := engine.ProgressOnce(ctx); err != nil {
-		t.Fatalf("ProgressOnce() error = %v", err)
+	for i := 0; i < 10; i++ {
+		if err := engine.ProgressOnce(ctx); err != nil {
+			t.Fatalf("ProgressOnce() attempt %d error = %v", i+1, err)
+		}
 	}
-	if availableUTXORequests != 1 {
-		t.Fatalf("available UTXO requests = %d, want 1", availableUTXORequests)
+	if availableUTXORequests != 10 {
+		t.Fatalf("available UTXO requests after 10 failures = %d, want 10", availableUTXORequests)
 	}
 
 	if err := engine.ProgressOnce(ctx); err != nil {
-		t.Fatalf("ProgressOnce() immediate retry error = %v", err)
+		t.Fatalf("ProgressOnce() backoff attempt error = %v", err)
 	}
-	if availableUTXORequests != 1 {
-		t.Fatalf("available UTXO requests after immediate retry = %d, want 1", availableUTXORequests)
+	if availableUTXORequests != 10 {
+		t.Fatalf("available UTXO requests during backoff = %d, want 10", availableUTXORequests)
 	}
 }
 
@@ -510,5 +512,154 @@ func TestConfirmOnceRebroadcastsRevealWhenUnisatTxNotVisible(t *testing.T) {
 	}
 	if pushCount != 1 {
 		t.Fatalf("push count = %d, want 1", pushCount)
+	}
+}
+
+func TestConfirmOnceRollsBackToCommitSignedWhenRevealBroadcastInputsMissingInUnisatMode(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "unisat-reveal-rollback.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "committxid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, height); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+
+	var revealPushCount int
+	var commitPushCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			var req struct {
+				TxHex string `json:"txHex"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			switch req.TxHex {
+			case "reveal-hex":
+				revealPushCount++
+				_, _ = w.Write([]byte(`{"code":-1,"msg":"commit_broadcast_failed err=bad-txns-inputs-missingorspent","data":null}`))
+			case "commit-hex":
+				commitPushCount++
+				_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":null}`))
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+			}
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/indexer/tx/"):
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() first error = %v", err)
+	}
+	if revealPushCount != 1 {
+		t.Fatalf("reveal push count = %d, want 1", revealPushCount)
+	}
+	if commitPushCount != 0 {
+		t.Fatalf("commit push count after rollback round = %d, want 0", commitPushCount)
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() after rollback error = %v", err)
+	}
+	if message.Status != model.MessageStatusCommitSigned {
+		t.Fatalf("message status after rollback = %q, want %q", message.Status, model.MessageStatusCommitSigned)
+	}
+	if message.TxID != "" {
+		t.Fatalf("message txid after rollback = %q, want empty", message.TxID)
+	}
+	if message.ConfirmHeight != 0 {
+		t.Fatalf("message confirm height after rollback = %d, want 0", message.ConfirmHeight)
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() second error = %v", err)
+	}
+	if commitPushCount != 1 {
+		t.Fatalf("commit push count after retry = %d, want 1", commitPushCount)
+	}
+}
+
+func TestProgressOnceBacksOffAfterTenCommitConfirmCheckFailures(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "commit-confirm-check-backoff.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "committxid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+
+	var txLookupCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/indexer/tx/"):
+			txLookupCount++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-1,"msg":"get tx failed","data":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+
+	for i := 0; i < 10; i++ {
+		if err := engine.ProgressOnce(ctx); err != nil {
+			t.Fatalf("ProgressOnce() attempt %d error = %v", i+1, err)
+		}
+	}
+	if txLookupCount != 10 {
+		t.Fatalf("tx lookup count after 10 failures = %d, want 10", txLookupCount)
+	}
+
+	if err := engine.ProgressOnce(ctx); err != nil {
+		t.Fatalf("ProgressOnce() backoff attempt error = %v", err)
+	}
+	if txLookupCount != 10 {
+		t.Fatalf("tx lookup count during backoff = %d, want 10", txLookupCount)
 	}
 }

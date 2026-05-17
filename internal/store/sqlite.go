@@ -877,6 +877,28 @@ func (s *Store) MarkMessageSignedWithReveal(ctx context.Context, messageID int64
 	return nil
 }
 
+func (s *Store) RollbackMessageToCommitSigned(ctx context.Context, messageID int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE messages
+		SET status = ?,
+			txid = NULL,
+			broadcast_at = NULL,
+			confirm_height = 0,
+			reveal_broadcast_at = NULL,
+			reveal_confirm_height = 0,
+			updated_at = ?
+		WHERE id = ? AND parent_message_id IS NULL
+	`, model.MessageStatusCommitSigned, time.Now().UTC().Format(time.RFC3339), messageID)
+	if err != nil {
+		return false, fmt.Errorf("rollback message %d to commit_signed: %w", messageID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("get rollback message row count %d: %w", messageID, err)
+	}
+	return rowsAffected > 0, nil
+}
+
 func (s *Store) ResetMessageToBuilding(ctx context.Context, messageID int64) (bool, error) {
 	res, err := s.DB.ExecContext(ctx, `
 		UPDATE messages
