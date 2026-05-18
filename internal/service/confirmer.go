@@ -12,7 +12,7 @@ import (
 
 const progressRetryDelay = 3 * time.Second
 const progressRetryThreshold = 10
-const revealCommitInputsSpentError = "bad-txns-inputs-missingorspent"
+const txInputsMissingOrSpentError = "bad-txns-inputs-missingorspent"
 
 func (e *Engine) markProgressFailure() {
 	e.ProgressErrCount++
@@ -32,11 +32,11 @@ func (e *Engine) clearProgressFailures() {
 	e.ProgressErrCount = 0
 }
 
-func isCommitInputsMissingOrSpent(err error) bool {
+func isTxInputsMissingOrSpent(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), revealCommitInputsSpentError)
+	return strings.Contains(strings.ToLower(err.Error()), txInputsMissingOrSpentError)
 }
 
 func (e *Engine) ConfirmOnce(ctx context.Context) error {
@@ -103,6 +103,23 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastSigned(ctx, message.ID, message.RawTxHex)
 				if err != nil {
 					e.LogMessagef(message, "commit_broadcast_failed err=%v", err)
+					if isTxInputsMissingOrSpent(err) {
+						rebuilt, rebuildErr := e.Store.ResetMessageToBuilding(ctx, message.ID)
+						if rebuildErr != nil {
+							return rebuildErr
+						}
+						if rebuilt {
+							message.Status = model.MessageStatusBuilding
+							message.TxID = ""
+							message.RawTxHex = ""
+							message.ConfirmHeight = 0
+							message.RevealTxID = ""
+							message.RevealRawTxHex = ""
+							message.RevealBroadcastAt = ""
+							message.RevealConfirmHeight = 0
+							e.LogMessagef(message, "commit_broadcast_rebuild_to_building reason=%s", txInputsMissingOrSpentError)
+						}
+					}
 					e.markProgressFailure()
 					advanced = false
 					break
@@ -199,7 +216,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				txid, err := e.BroadcastReveal(ctx, message.ID)
 				if err != nil {
 					e.LogMessagef(message, "reveal_broadcast_failed err=%v", err)
-					if e.isUnisatOpenAPIMode() && isCommitInputsMissingOrSpent(err) {
+					if e.isUnisatOpenAPIMode() && isTxInputsMissingOrSpent(err) {
 						rolledBack, rbErr := e.Store.RollbackMessageToCommitSigned(ctx, message.ID)
 						if rbErr != nil {
 							return rbErr
@@ -210,7 +227,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 							message.ConfirmHeight = 0
 							message.RevealBroadcastAt = ""
 							message.RevealConfirmHeight = 0
-							e.LogMessagef(message, "reveal_broadcast_rollback_to_commit_signed reason=%s", revealCommitInputsSpentError)
+							e.LogMessagef(message, "reveal_broadcast_rollback_to_commit_signed reason=%s", txInputsMissingOrSpentError)
 						}
 					}
 					e.markProgressFailure()

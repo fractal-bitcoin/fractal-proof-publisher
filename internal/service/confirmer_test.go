@@ -607,6 +607,70 @@ func TestConfirmOnceRollsBackToCommitSignedWhenRevealBroadcastInputsMissingInUni
 	}
 }
 
+func TestConfirmOnceRebuildsWhenCommitBroadcastInputsMissing(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "commit-rebuild.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+
+	var commitPushCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			commitPushCount++
+			_, _ = w.Write([]byte(`{"code":-1,"msg":"commit_broadcast_failed err=bad-txns-inputs-missingorspent","data":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+	if commitPushCount != 1 {
+		t.Fatalf("commit push count = %d, want 1", commitPushCount)
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() after rebuild error = %v", err)
+	}
+	if message.Status != model.MessageStatusBuilding {
+		t.Fatalf("message status after rebuild = %q, want %q", message.Status, model.MessageStatusBuilding)
+	}
+	if message.TxID != "" {
+		t.Fatalf("message txid after rebuild = %q, want empty", message.TxID)
+	}
+	if message.RawTxHex != "" {
+		t.Fatalf("message raw tx after rebuild = %q, want empty", message.RawTxHex)
+	}
+	if message.RevealTxID != "" {
+		t.Fatalf("message reveal txid after rebuild = %q, want empty", message.RevealTxID)
+	}
+	if message.RevealRawTxHex != "" {
+		t.Fatalf("message reveal raw tx after rebuild = %q, want empty", message.RevealRawTxHex)
+	}
+}
+
 func TestProgressOnceBacksOffAfterTenCommitConfirmCheckFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "commit-confirm-check-backoff.db")
 	s, err := store.Open(dbPath)
