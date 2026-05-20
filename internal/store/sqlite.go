@@ -925,6 +925,33 @@ func (s *Store) ResetMessageToBuilding(ctx context.Context, messageID int64) (bo
 	return rowsAffected > 0, nil
 }
 
+func (s *Store) ResetMessageToBuildingWithPayload(ctx context.Context, messageID int64, payload string) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE messages
+		SET status = ?,
+			payload_text = ?,
+			txid = NULL,
+			raw_tx_hex = NULL,
+			broadcast_at = NULL,
+			confirm_height = 0,
+			failure_reason = NULL,
+			reveal_txid = NULL,
+			reveal_raw_tx_hex = NULL,
+			reveal_broadcast_at = NULL,
+			reveal_confirm_height = 0,
+			updated_at = ?
+		WHERE id = ? AND parent_message_id IS NULL
+	`, model.MessageStatusBuilding, payload, time.Now().UTC().Format(time.RFC3339), messageID)
+	if err != nil {
+		return false, fmt.Errorf("reset message %d to building with payload: %w", messageID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("get reset message row count %d: %w", messageID, err)
+	}
+	return rowsAffected > 0, nil
+}
+
 func (s *Store) MarkMessageBroadcasted(ctx context.Context, messageID int64, txid string) error {
 	_, err := s.DB.ExecContext(ctx, `
 		UPDATE messages SET status = ?, txid = ?, broadcast_at = ?, updated_at = ? WHERE id = ?

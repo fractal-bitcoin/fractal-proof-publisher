@@ -15,6 +15,7 @@ import (
 	"fractal-proof-publisher/internal/feeapi"
 	"fractal-proof-publisher/internal/keys"
 	"fractal-proof-publisher/internal/model"
+	"fractal-proof-publisher/internal/protocol"
 	"fractal-proof-publisher/internal/service"
 	"fractal-proof-publisher/internal/stateapi"
 	"fractal-proof-publisher/internal/store"
@@ -68,10 +69,6 @@ func RunMode(ctx context.Context, cfg config.Config, mode string) error {
 	}
 	defer s.DB.Close()
 
-	if err := startHealthServer(ctx, cfg.Runtime.HealthAddr, s, mode); err != nil {
-		return err
-	}
-
 	if err := s.SeedInitialUTXOs(ctx, cfg.Signing.InitialUTXOs); err != nil {
 		return err
 	}
@@ -100,6 +97,10 @@ func RunMode(ctx context.Context, cfg config.Config, mode string) error {
 		UnisatOpenAPI: unisatOpenAPI,
 		Config:        cfg,
 		KeyMaterial:   keyMaterial,
+	}
+
+	if err := startHealthServer(ctx, cfg.Runtime.HealthAddr, s, &engine, mode); err != nil {
+		return err
 	}
 
 	if cfg.Scan.PollInterval <= 0 {
@@ -151,7 +152,7 @@ func RunMode(ctx context.Context, cfg config.Config, mode string) error {
 	}
 }
 
-func startHealthServer(ctx context.Context, addr string, s *store.Store, mode string) error {
+func startHealthServer(ctx context.Context, addr string, s *store.Store, engine *service.Engine, mode string) error {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return nil
@@ -224,12 +225,29 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, mode st
 			http.Error(w, fmt.Sprintf("get message: %v", err), http.StatusNotFound)
 			return
 		}
-		if !isRebuildableMessageStatus(message.Status) {
+
+		allowRebuild := isRebuildableMessageStatus(message.Status)
+		rebuildPayload := ""
+		if !allowRebuild && message.Type == model.MessageTypeProve && message.Status == model.MessageStatusDone {
+			newPayload, changed, err := rebuildDoneProvePayload(ctx, engine, message)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("recompute prove hash: %v", err), http.StatusInternalServerError)
+				return
+			}
+			allowRebuild = changed
+			rebuildPayload = newPayload
+		}
+		if !allowRebuild {
 			http.Error(w, fmt.Sprintf("message status %s cannot be rebuilt", message.Status), http.StatusConflict)
 			return
 		}
 
-		updated, err := s.ResetMessageToBuilding(ctx, req.MessageID)
+		var updated bool
+		if rebuildPayload != "" {
+			updated, err = s.ResetMessageToBuildingWithPayload(ctx, req.MessageID, rebuildPayload)
+		} else {
+			updated, err = s.ResetMessageToBuilding(ctx, req.MessageID)
+		}
 		if err != nil {
 			http.Error(w, fmt.Sprintf("reset message: %v", err), http.StatusInternalServerError)
 			return
@@ -247,7 +265,6 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, mode st
 			Previous:  summarizeMessageState(message),
 		})
 	})
-
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -292,6 +309,68 @@ func summarizeMessageState(message store.MessageRecord) messageStateSummary {
 		RevealSent: message.RevealBroadcastAt != "",
 		RevealDone: message.RevealConfirmHeight != 0,
 	}
+}
+
+func rebuildDoneProvePayload(ctx context.Context, engine *service.Engine, message store.MessageRecord) (string, bool, error) {
+	if engine == nil || engine.StateAPI == nil {
+		return "", false, fmt.Errorf("engine state api is not configured")
+	}
+
+	indexerID, height, oldHash, err := parseProvePayload(message.PayloadText)
+	if err != nil {
+		return "", false, err
+	}
+
+	state, err := engine.StateAPI.GetHeightState(ctx, height)
+	if err != nil {
+		return "", false, err
+	}
+	if strings.TrimSpace(state.StateHash) == "" {
+		return "", false, fmt.Errorf("state hash is empty for height %d", height)
+	}
+	blockHash := strings.TrimSpace(state.BlockHash)
+	if blockHash == "" {
+		if engine.RPC == nil {
+			return "", false, fmt.Errorf("state api returned empty block hash for height %d and rpc client is not configured", height)
+		}
+		blockHash, err = engine.RPC.GetBlockHash(ctx, height)
+		if err != nil {
+			return "", false, fmt.Errorf("fallback get block hash at %d: %w", height, err)
+		}
+	}
+
+	newHash, err := protocol.ComputeProveHash(indexerID, blockHash, state.StateHash)
+	if err != nil {
+		return "", false, err
+	}
+	changed := !strings.EqualFold(strings.TrimSpace(oldHash), strings.TrimSpace(newHash))
+	if !changed {
+		return "", false, nil
+	}
+	payload, err := protocol.EncodeProveText(model.ProveData{
+		IndexerID:   indexerID,
+		ProveHeight: height,
+		ProveHash:   newHash,
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return string(payload), true, nil
+}
+
+func parseProvePayload(payload string) (string, uint64, string, error) {
+	parts := strings.Split(strings.TrimSpace(payload), ",")
+	if len(parts) < 6 {
+		return "", 0, "", fmt.Errorf("invalid prove payload format")
+	}
+	if parts[2] != protocol.OpProve {
+		return "", 0, "", fmt.Errorf("payload op %s is not %s", parts[2], protocol.OpProve)
+	}
+	height, err := strconv.ParseUint(strings.TrimSpace(parts[4]), 10, 64)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("parse prove height: %w", err)
+	}
+	return strings.TrimSpace(parts[3]), height, strings.TrimSpace(parts[5]), nil
 }
 
 func runLoopOnce(ctx context.Context, engine *service.Engine) error {

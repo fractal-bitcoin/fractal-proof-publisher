@@ -182,3 +182,50 @@ func TestCreateBroadcastAttempt(t *testing.T) {
 		t.Fatalf("broadcast attempt error = %q, want %q", attempts[0].ErrorMessage, "reveal prepared")
 	}
 }
+
+func TestResetMessageToBuildingWithPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reset-with-payload.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "old-payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "reveal-txid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "commit-txid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+
+	updated, err := s.ResetMessageToBuildingWithPayload(ctx, messageID, "new-payload")
+	if err != nil {
+		t.Fatalf("ResetMessageToBuildingWithPayload() error = %v", err)
+	}
+	if !updated {
+		t.Fatal("ResetMessageToBuildingWithPayload() updated = false, want true")
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusBuilding {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusBuilding)
+	}
+	if message.PayloadText != "new-payload" {
+		t.Fatalf("payload = %q, want %q", message.PayloadText, "new-payload")
+	}
+	if message.TxID != "" || message.RawTxHex != "" || message.RevealTxID != "" || message.RevealRawTxHex != "" {
+		t.Fatalf("tx fields not cleared txid=%q raw=%q reveal_txid=%q reveal_raw=%q", message.TxID, message.RawTxHex, message.RevealTxID, message.RevealRawTxHex)
+	}
+	if message.ConfirmHeight != 0 || message.RevealConfirmHeight != 0 {
+		t.Fatalf("confirm heights not cleared confirm=%d reveal_confirm=%d", message.ConfirmHeight, message.RevealConfirmHeight)
+	}
+}
