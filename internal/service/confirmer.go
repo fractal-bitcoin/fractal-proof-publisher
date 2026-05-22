@@ -11,7 +11,7 @@ import (
 )
 
 const progressRetryDelay = 3 * time.Second
-const progressRetryThreshold = 10
+const progressRetryThreshold = 100
 const txInputsMissingOrSpentError = "bad-txns-inputs-missingorspent"
 
 func (e *Engine) markProgressFailure() {
