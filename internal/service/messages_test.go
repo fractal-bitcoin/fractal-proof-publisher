@@ -105,13 +105,22 @@ func TestBuildAndSign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseSignedTx() error = %v", err)
 	}
-	if len(msg.TxOut) != 2 {
-		t.Fatalf("commit tx outputs = %d, want 2", len(msg.TxOut))
+	if len(msg.TxOut) != 1 {
+		t.Fatalf("commit tx outputs = %d, want 1", len(msg.TxOut))
 	}
 
 	env, err := inscription.NewTextEnvelope([]byte(payload))
 	if err != nil {
 		t.Fatalf("NewTextEnvelope() error = %v", err)
+	}
+	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFeeWithOpReturn(env.CommitPlan(keyMaterial.PublicKey), chaincfg.MainNetParams.Name, changeAddress, 8, []byte(payload))
+	if err != nil {
+		t.Fatalf("EstimateRevealFeeWithOpReturn() error = %v", err)
+	}
+	commitOutputValue := msg.TxOut[0].Value
+	revealChangeValue := commitOutputValue - revealFeeValue - txbuilder.DefaultOpReturnValue
+	if revealChangeValue <= 0 {
+		t.Fatalf("reveal change value = %d, want > 0", revealChangeValue)
 	}
 	commitUnsigned, err := txbuilder.Build(txbuilder.BuildInput{
 		Inputs: []model.UTXO{{
@@ -127,9 +136,9 @@ func TestBuildAndSign(t *testing.T) {
 		CommitPlan:        env.CommitPlan(keyMaterial.PublicKey),
 		FeeRateSatVB:      8,
 		CommitOutputValue: msg.TxOut[0].Value,
-		ChangeValue:       msg.TxOut[1].Value,
-		RevealOutputValue: txbuilder.DefaultRevealPostage,
+		RevealOutputValue: msg.TxOut[0].Value - revealFeeValue - txbuilder.DefaultOpReturnValue,
 		RevealRecipient:   changeAddress,
+		RevealOpReturn:    []byte(payload),
 	})
 	if err != nil {
 		t.Fatalf("Build(commitUnsigned) error = %v", err)
@@ -150,26 +159,15 @@ func TestBuildAndSign(t *testing.T) {
 	if finalizedReveal.RawTxHex == "" {
 		t.Fatal("finalized reveal raw tx is empty")
 	}
-	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFee(env.CommitPlan(keyMaterial.PublicKey), chaincfg.MainNetParams.Name, changeAddress, 8)
-	if err != nil {
-		t.Fatalf("EstimateRevealFee() error = %v", err)
-	}
-	commitOutputValue := msg.TxOut[0].Value
-	if commitOutputValue != txbuilder.DefaultRevealPostage+revealFeeValue {
-		t.Fatalf("commit output value = %d, want %d", commitOutputValue, txbuilder.DefaultRevealPostage+revealFeeValue)
-	}
-	commitFeeValue := int64(5000) - commitOutputValue - msg.TxOut[1].Value
+	commitFeeValue := int64(5000) - commitOutputValue
 	if commitFeeValue <= 0 {
 		t.Fatalf("commit fee value = %d, want > 0", commitFeeValue)
 	}
-	if commitFeeValue+commitOutputValue+msg.TxOut[1].Value != 5000 {
-		t.Fatalf("commit tx conservation mismatch: fee=%d commit=%d change=%d total=%d", commitFeeValue, commitOutputValue, msg.TxOut[1].Value, 5000)
+	if commitFeeValue+commitOutputValue != 5000 {
+		t.Fatalf("commit tx conservation mismatch: fee=%d commit=%d total=%d", commitFeeValue, commitOutputValue, 5000)
 	}
-	if commitOutputValue != txbuilder.DefaultRevealPostage+revealFeeValue {
-		t.Fatalf("commit output does not reserve reveal fee: got %d, reveal fee %d", commitOutputValue, revealFeeValue)
-	}
-	if commitOutputValue-txbuilder.DefaultRevealPostage != revealFeeValue {
-		t.Fatalf("reserved reveal fee = %d, want %d", commitOutputValue-txbuilder.DefaultRevealPostage, revealFeeValue)
+	if commitOutputValue-txbuilder.DefaultOpReturnValue-revealChangeValue != revealFeeValue {
+		t.Fatalf("reserved reveal fee = %d, want %d", commitOutputValue-txbuilder.DefaultOpReturnValue-revealChangeValue, revealFeeValue)
 	}
 	if revealVBytes <= 0 {
 		t.Fatalf("reveal vbytes = %d, want > 0", revealVBytes)
@@ -201,6 +199,28 @@ func TestBuildAndSign(t *testing.T) {
 	}
 	if storedMessage.RevealRawTxHex == "" {
 		t.Fatal("stored message reveal raw tx is empty")
+	}
+	revealTx, _, err := parseSignedTx(storedMessage.RevealRawTxHex)
+	if err != nil {
+		t.Fatalf("parse reveal tx error = %v", err)
+	}
+	if len(revealTx.TxOut) != 2 {
+		t.Fatalf("reveal tx outputs = %d, want 2", len(revealTx.TxOut))
+	}
+	if revealTx.TxOut[0].Value != txbuilder.DefaultOpReturnValue {
+		t.Fatalf("reveal opreturn value = %d, want %d", revealTx.TxOut[0].Value, txbuilder.DefaultOpReturnValue)
+	}
+	if len(revealTx.TxOut[0].PkScript) == 0 || revealTx.TxOut[0].PkScript[0] != 0x6a {
+		t.Fatalf("reveal output is not OP_RETURN: %x", revealTx.TxOut[0].PkScript)
+	}
+	if !strings.Contains(hex.EncodeToString(revealTx.TxOut[0].PkScript), hex.EncodeToString([]byte(payload))) {
+		t.Fatal("reveal opreturn does not contain proof payload")
+	}
+	if revealTx.TxOut[1].Value != revealChangeValue {
+		t.Fatalf("reveal change value = %d, want %d", revealTx.TxOut[1].Value, revealChangeValue)
+	}
+	if hex.EncodeToString(revealTx.TxOut[1].PkScript) != expectedChangeScript {
+		t.Fatalf("reveal change script = %x, want %s", revealTx.TxOut[1].PkScript, expectedChangeScript)
 	}
 
 	revealBroadcastTxID, err := engine.BroadcastReveal(ctx, messageID)
@@ -239,11 +259,11 @@ func TestBuildAndSign(t *testing.T) {
 	if pendingStatus != string(model.UTXOStatusPending) {
 		t.Fatalf("pending change status = %q, want %q", pendingStatus, model.UTXOStatusPending)
 	}
-	if pendingTxID != expectedTxID {
-		t.Fatalf("pending change utxo txid = %q, want %q", pendingTxID, expectedTxID)
+	if pendingTxID != storedMessage.RevealTxID {
+		t.Fatalf("pending change utxo txid = %q, want %q", pendingTxID, storedMessage.RevealTxID)
 	}
-	if pendingAmount != msg.TxOut[1].Value {
-		t.Fatalf("pending change utxo amount = %d, want %d", pendingAmount, msg.TxOut[1].Value)
+	if pendingAmount != revealChangeValue {
+		t.Fatalf("pending change utxo amount = %d, want %d", pendingAmount, revealChangeValue)
 	}
 	if pendingAddress != changeAddress {
 		t.Fatalf("pending change utxo address = %q, want %q", pendingAddress, changeAddress)

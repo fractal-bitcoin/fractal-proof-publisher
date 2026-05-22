@@ -99,18 +99,35 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 		}
 		feeRate = feeapi.SelectFeeRate(fees, e.Config.FeeAPI.Strategy, e.Config.FeeAPI.MinFeeRateSatVB, e.Config.FeeAPI.MaxFeeRateSatVB)
 	}
-	commitOutputValue := txbuilder.DefaultRevealPostage
+	revealOpReturn := revealOpReturnPayload(payload)
+	revealOutputValue := txbuilder.DefaultRevealPostage
+	minimumCommitOutputValue := revealOutputValue
+	if len(revealOpReturn) > 0 {
+		revealOutputValue = 0
+		minimumCommitOutputValue = txbuilder.DefaultOpReturnValue
+	}
 	sendChangeMinValue := e.Config.Tx.SendChangeMinValue
 	if sendChangeMinValue <= 0 {
 		sendChangeMinValue = txbuilder.DefaultSendChangeMin
 	}
-	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFee(commitPlan, e.Config.BitcoinRPC.Network, e.Config.Signing.ChangeAddress, feeRate)
+	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFeeWithOpReturn(commitPlan, e.Config.BitcoinRPC.Network, e.Config.Signing.ChangeAddress, feeRate, revealOpReturn)
 	if err != nil {
 		return "", err
 	}
-	funding, err := txbuilder.PlanFunding(available, feeRate, commitOutputValue+revealFeeValue, sendChangeMinValue)
+	var funding txbuilder.FundingPlan
+	if len(revealOpReturn) > 0 {
+		funding, err = txbuilder.PlanFundingWithoutCommitChange(available, feeRate, minimumCommitOutputValue+revealFeeValue)
+	} else {
+		funding, err = txbuilder.PlanFunding(available, feeRate, minimumCommitOutputValue+revealFeeValue, sendChangeMinValue)
+	}
 	if err != nil {
 		return "", err
+	}
+	if len(revealOpReturn) > 0 {
+		revealOutputValue = funding.CommitOutputValue - revealFeeValue - txbuilder.DefaultOpReturnValue
+		if revealOutputValue < 0 {
+			return "", fmt.Errorf("negative reveal change value: %d", revealOutputValue)
+		}
 	}
 	e.Logf(
 		"build_sign_plan message_id=%d available_utxos=%d selected_inputs=%d fee_rate_sat_vb=%d commit_output_sat=%d reveal_fee_sat=%d change_sat=%d total_fee_sat=%d",
@@ -138,8 +155,9 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 		FeeRateSatVB:      feeRate,
 		CommitOutputValue: funding.CommitOutputValue,
 		ChangeValue:       funding.ChangeValue,
-		RevealOutputValue: txbuilder.DefaultRevealPostage,
+		RevealOutputValue: revealOutputValue,
 		RevealRecipient:   e.Config.Signing.ChangeAddress,
+		RevealOpReturn:    revealOpReturn,
 	})
 	if err != nil {
 		if !e.isUnisatOpenAPIMode() {
@@ -181,8 +199,12 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 		}
 		return "", err
 	}
-	if !e.isUnisatOpenAPIMode() && unsigned.ChangeValue > 0 {
-		changeUTXO, err := buildBroadcastChangeUTXO(signed, e.Config.Signing.ChangeAddress, e.Config.BitcoinRPC.Network)
+	if !e.isUnisatOpenAPIMode() && (unsigned.ChangeValue > 0 || finalizedReveal.RecipientValue > 0) {
+		changeSourceTxHex := signed
+		if finalizedReveal.RecipientValue > 0 {
+			changeSourceTxHex = finalizedReveal.RawTxHex
+		}
+		changeUTXO, err := buildBroadcastChangeUTXO(changeSourceTxHex, e.Config.Signing.ChangeAddress, e.Config.BitcoinRPC.Network)
 		if err != nil {
 			_ = e.Store.ReleaseReservedUTXOs(ctx, messageID)
 			return "", err
@@ -199,6 +221,23 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 	}
 	e.Logf("build_sign_done message_id=%d commit_txid=%s reveal_txid=%s reveal_vbytes=%d", messageID, mustBroadcastTxID(signed), revealTxID, revealVBytes)
 	return signed, nil
+}
+
+func revealOpReturnPayload(payload string) []byte {
+	parts := strings.Split(payload, ",")
+	if len(parts) < 3 {
+		return nil
+	}
+	if strings.TrimSpace(parts[0]) != protocol.ProtocolName {
+		return nil
+	}
+	if strings.TrimSpace(parts[1]) != protocol.ProtocolVersion {
+		return nil
+	}
+	if strings.TrimSpace(parts[2]) != protocol.OpProve {
+		return nil
+	}
+	return []byte(payload)
 }
 
 func (e *Engine) listAvailableUTXOs(ctx context.Context) ([]model.UTXO, error) {
