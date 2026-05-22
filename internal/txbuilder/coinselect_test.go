@@ -48,6 +48,32 @@ func TestEstimateRevealFeeAndCommitFundingCloseValueLoop(t *testing.T) {
 	}
 }
 
+func TestEstimateRevealFeeWithOpReturnAllowsRevealChangeOutput(t *testing.T) {
+	keyMaterial, err := keys.Load("", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	recipient, err := keyMaterial.Address(mainnetParams(), "p2tr")
+	if err != nil {
+		t.Fatalf("Address() error = %v", err)
+	}
+	payload := []byte("fip101,1,submit_proof,100:1,100,00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	env, err := inscription.NewTextEnvelope(payload)
+	if err != nil {
+		t.Fatalf("NewTextEnvelope() error = %v", err)
+	}
+	revealVBytes, revealFee, err := EstimateRevealFeeWithOpReturn(env.CommitPlan(keyMaterial.PublicKey), mainnetParams().Name, recipient, 8, payload)
+	if err != nil {
+		t.Fatalf("EstimateRevealFeeWithOpReturn() error = %v", err)
+	}
+	if revealVBytes <= 0 {
+		t.Fatalf("reveal vbytes = %d, want > 0", revealVBytes)
+	}
+	if revealFee <= 0 {
+		t.Fatalf("reveal fee = %d, want > 0", revealFee)
+	}
+}
+
 func TestSelectInputs(t *testing.T) {
 	selected, total, err := SelectInputs([]model.UTXO{
 		{TxID: "a", AmountSat: 400},

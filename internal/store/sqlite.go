@@ -1136,3 +1136,15 @@ func (s *Store) MarkChangeUTXOsConfirmed(ctx context.Context, messageID int64, c
 	}
 	return nil
 }
+
+func (s *Store) MarkChangeUTXOsConfirmedByTxID(ctx context.Context, messageID int64, txid string, confirmHeight uint64) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE utxos
+		SET status = ?, confirm_height = ?, updated_at = ?
+		WHERE reserved_by_message_id = ? AND source = ? AND status = ? AND txid = ?
+	`, model.UTXOStatusAvailable, confirmHeight, time.Now().UTC().Format(time.RFC3339), messageID, model.UTXOSourceChange, model.UTXOStatusPending, txid)
+	if err != nil {
+		return fmt.Errorf("mark change utxos confirmed by txid: %w", err)
+	}
+	return nil
+}

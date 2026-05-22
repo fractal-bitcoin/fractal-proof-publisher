@@ -199,18 +199,15 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 		}
 		return "", err
 	}
-	if !e.isUnisatOpenAPIMode() && (unsigned.ChangeValue > 0 || finalizedReveal.RecipientValue > 0) {
-		changeSourceTxHex := signed
+	if !e.isUnisatOpenAPIMode() {
+		if unsigned.ChangeValue > 0 {
+			if err := e.insertBroadcastChangeUTXO(ctx, messageID, signed); err != nil {
+				_ = e.Store.ReleaseReservedUTXOs(ctx, messageID)
+				return "", err
+			}
+		}
 		if finalizedReveal.RecipientValue > 0 {
-			changeSourceTxHex = finalizedReveal.RawTxHex
-		}
-		changeUTXO, err := buildBroadcastChangeUTXO(changeSourceTxHex, e.Config.Signing.ChangeAddress, e.Config.BitcoinRPC.Network)
-		if err != nil {
-			_ = e.Store.ReleaseReservedUTXOs(ctx, messageID)
-			return "", err
-		}
-		if changeUTXO != nil {
-			if err := e.Store.InsertChangeUTXO(ctx, messageID, *changeUTXO); err != nil {
+			if err := e.insertBroadcastChangeUTXO(ctx, messageID, finalizedReveal.RawTxHex); err != nil {
 				_ = e.Store.ReleaseReservedUTXOs(ctx, messageID)
 				return "", err
 			}
@@ -237,7 +234,18 @@ func revealOpReturnPayload(payload string) []byte {
 	if strings.TrimSpace(parts[2]) != protocol.OpProve {
 		return nil
 	}
-	return []byte(payload)
+	return []byte("FIP-101:" + protocol.OpProve + ":reveal")
+}
+
+func (e *Engine) insertBroadcastChangeUTXO(ctx context.Context, messageID int64, txHex string) error {
+	changeUTXO, err := buildBroadcastChangeUTXO(txHex, e.Config.Signing.ChangeAddress, e.Config.BitcoinRPC.Network)
+	if err != nil {
+		return err
+	}
+	if changeUTXO == nil {
+		return nil
+	}
+	return e.Store.InsertChangeUTXO(ctx, messageID, *changeUTXO)
 }
 
 func (e *Engine) listAvailableUTXOs(ctx context.Context) ([]model.UTXO, error) {

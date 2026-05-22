@@ -250,7 +250,7 @@ func EstimateRevealFeeWithOpReturn(commitPlan inscription.CommitPlan, network, r
 		RevealOpReturn:    opReturnData,
 	}
 	if len(opReturnData) > 0 {
-		revealInput.CommitOutputValue = DefaultOpReturnValue
+		revealInput.CommitOutputValue = DefaultOpReturnValue + DefaultSendChangeMin
 		revealInput.RevealOutputValue = DefaultSendChangeMin
 	}
 	revealPlan, err := buildRevealPlan(revealInput, spendPlan, commitOutputScript)

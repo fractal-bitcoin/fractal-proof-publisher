@@ -184,7 +184,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					if err := e.Store.MarkUTXOConfirmed(ctx, message.TxID, confirmHeight); err != nil {
 						return err
 					}
-					if err := e.Store.MarkChangeUTXOsConfirmed(ctx, message.ID, confirmHeight); err != nil {
+					if err := e.Store.MarkChangeUTXOsConfirmedByTxID(ctx, message.ID, message.TxID, confirmHeight); err != nil {
 						return err
 					}
 				}
@@ -310,6 +310,11 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				e.LogMessagef(message, "reveal_confirmed_detected confirm_height=%d tx_index=%d", confirmHeight, txIndex)
 				if err := e.Store.MarkRevealConfirmed(ctx, message.ID, confirmHeight); err != nil {
 					return err
+				}
+				if !e.isUnisatOpenAPIMode() {
+					if err := e.Store.MarkChangeUTXOsConfirmedByTxID(ctx, message.ID, message.RevealTxID, confirmHeight); err != nil {
+						return err
+					}
 				}
 				if message.Type == model.MessageTypeRegister {
 					indexerID := fmt.Sprintf("%d:%d", confirmHeight, txIndex)

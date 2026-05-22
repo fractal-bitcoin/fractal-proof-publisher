@@ -287,8 +287,93 @@ func TestConfirmOncePromotesPendingChangeUTXO(t *testing.T) {
 	if err := s.MarkMessageBroadcasted(ctx, messageID, "deadbeef"); err != nil {
 		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
 	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, height); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "abcd", "beadfeed", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkRevealBroadcasted(ctx, messageID, "revealtxid"); err != nil {
+		t.Fatalf("MarkRevealBroadcasted() error = %v", err)
+	}
 	if err := s.InsertChangeUTXO(ctx, messageID, model.UTXO{
-		TxID:         "deadbeef",
+		TxID:         "revealtxid",
+		Vout:         1,
+		AmountSat:    1234,
+		Address:      "bc1ptest",
+		ScriptPubKey: "5120abcd",
+		AddressType:  "p2tr",
+		Status:       model.UTXOStatusPending,
+		Source:       model.UTXOSourceChange,
+	}); err != nil {
+		t.Fatalf("InsertChangeUTXO() error = %v", err)
+	}
+	if err := s.SetChainState(ctx, "last_scanned_height", "101"); err != nil {
+		t.Fatalf("SetChainState() error = %v", err)
+	}
+
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch req.Method {
+		case "getblockhash":
+			_, _ = w.Write([]byte(`{"result":"blockhash101","error":null}`))
+		case "getblock":
+			_, _ = w.Write([]byte(`{"result":{"hash":"blockhash101","height":101,"confirmations":1,"version":539361536,"tx":["revealtxid"]},"error":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	engine := Engine{
+		Store:  s,
+		RPC:    bitcoinrpc.New(rpcServer.URL, "", ""),
+		Config: config.Config{Scan: config.ScanConfig{MaxReorgDepth: 6}},
+	}
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+
+	available, err := s.ListAvailableUTXOs(ctx)
+	if err != nil {
+		t.Fatalf("ListAvailableUTXOs() error = %v", err)
+	}
+	if len(available) != 1 {
+		t.Fatalf("available change utxo count = %d, want 1", len(available))
+	}
+	if available[0].TxID != "revealtxid" {
+		t.Fatalf("available change txid = %q, want revealtxid", available[0].TxID)
+	}
+}
+
+func TestConfirmOnceDoesNotPromoteRevealChangeOnCommitConfirmation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "confirm-reveal-change-waits.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commitraw", "revealraw", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "committxid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+	if err := s.InsertChangeUTXO(ctx, messageID, model.UTXO{
+		TxID:         "revealtxid",
 		Vout:         1,
 		AmountSat:    1234,
 		Address:      "bc1ptest",
@@ -313,9 +398,9 @@ func TestConfirmOncePromotesPendingChangeUTXO(t *testing.T) {
 		}
 		switch req.Method {
 		case "getblockhash":
-			_, _ = w.Write([]byte(`{"result":"blockhash","error":null}`))
+			_, _ = w.Write([]byte(`{"result":"blockhash100","error":null}`))
 		case "getblock":
-			_, _ = w.Write([]byte(`{"result":{"hash":"blockhash","height":100,"confirmations":1,"version":539361536,"tx":["deadbeef"]},"error":null}`))
+			_, _ = w.Write([]byte(`{"result":{"hash":"blockhash100","height":100,"confirmations":1,"version":539361536,"tx":["committxid"]},"error":null}`))
 		default:
 			w.WriteHeader(http.StatusBadRequest)
 		}
@@ -335,11 +420,15 @@ func TestConfirmOncePromotesPendingChangeUTXO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAvailableUTXOs() error = %v", err)
 	}
-	if len(available) != 1 {
-		t.Fatalf("available change utxo count = %d, want 1", len(available))
+	if len(available) != 0 {
+		t.Fatalf("available change utxo count = %d, want 0 before reveal confirmation", len(available))
 	}
-	if available[0].TxID != "deadbeef" {
-		t.Fatalf("available change txid = %q, want deadbeef", available[0].TxID)
+	var status string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM utxos WHERE txid = ? AND vout = ?`, "revealtxid", 1).Scan(&status); err != nil {
+		t.Fatalf("query reveal change status error = %v", err)
+	}
+	if status != string(model.UTXOStatusPending) {
+		t.Fatalf("reveal change status = %q, want %q", status, model.UTXOStatusPending)
 	}
 }
 

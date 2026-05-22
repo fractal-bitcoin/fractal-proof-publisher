@@ -213,8 +213,11 @@ func TestBuildAndSign(t *testing.T) {
 	if len(revealTx.TxOut[0].PkScript) == 0 || revealTx.TxOut[0].PkScript[0] != 0x6a {
 		t.Fatalf("reveal output is not OP_RETURN: %x", revealTx.TxOut[0].PkScript)
 	}
-	if !strings.Contains(hex.EncodeToString(revealTx.TxOut[0].PkScript), hex.EncodeToString([]byte(payload))) {
-		t.Fatal("reveal opreturn does not contain proof payload")
+	if !strings.Contains(hex.EncodeToString(revealTx.TxOut[0].PkScript), hex.EncodeToString([]byte("FIP-101:submit_proof:reveal"))) {
+		t.Fatal("reveal opreturn does not contain proof marker")
+	}
+	if strings.Contains(hex.EncodeToString(revealTx.TxOut[0].PkScript), hex.EncodeToString([]byte(payload))) {
+		t.Fatal("reveal opreturn should not contain full proof payload")
 	}
 	if revealTx.TxOut[1].Value != revealChangeValue {
 		t.Fatalf("reveal change value = %d, want %d", revealTx.TxOut[1].Value, revealChangeValue)
