@@ -605,3 +605,82 @@ func TestMessageRebuildAdminEndpointDoneProveRebuildsWhenHashChanged(t *testing.
 		t.Fatalf("payload = %q, want %q", message.PayloadText, wantPayload)
 	}
 }
+
+func TestMessageRebuildAdminEndpointHeightTakesPrecedenceOverMessageID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild-height-precedence.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	otherHeight := uint64(1764200)
+	otherID, err := s.CreateMessage(ctx, model.MessageTypeProve, "other-payload", &otherHeight, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(other) error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, otherID, "other-commit", "other-reveal", "other-reveal-txid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal(other) error = %v", err)
+	}
+
+	targetHeight := uint64(1764241)
+	targetID, err := s.CreateMessage(ctx, model.MessageTypeProve, "target-payload", &targetHeight, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(target) error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, targetID, "target-commit", "target-reveal", "target-reveal-txid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal(target) error = %v", err)
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18096", s, nil, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18096/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(otherID, 10)+`,"height":`+strconv.FormatUint(targetHeight, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 200", resp.StatusCode, string(body))
+	}
+
+	var rebuildResp messageRebuildResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rebuildResp); err != nil {
+		t.Fatalf("decode rebuild response error = %v", err)
+	}
+	if rebuildResp.MessageID != targetID {
+		t.Fatalf("rebuild response message_id = %d, want %d", rebuildResp.MessageID, targetID)
+	}
+
+	target, err := s.GetMessage(ctx, targetID)
+	if err != nil {
+		t.Fatalf("GetMessage(target) error = %v", err)
+	}
+	if target.Status != model.MessageStatusBuilding {
+		t.Fatalf("target status = %q, want %q", target.Status, model.MessageStatusBuilding)
+	}
+	other, err := s.GetMessage(ctx, otherID)
+	if err != nil {
+		t.Fatalf("GetMessage(other) error = %v", err)
+	}
+	if other.Status != model.MessageStatusCommitSigned {
+		t.Fatalf("other status = %q, want %q", other.Status, model.MessageStatusCommitSigned)
+	}
+}

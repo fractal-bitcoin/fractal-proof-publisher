@@ -33,7 +33,8 @@ type statusResponse struct {
 }
 
 type messageRebuildRequest struct {
-	MessageID int64 `json:"message_id"`
+	MessageID int64  `json:"message_id"`
+	Height    uint64 `json:"height"`
 }
 
 type messageRebuildResponse struct {
@@ -215,15 +216,31 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, engine 
 			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
 			return
 		}
-		if req.MessageID <= 0 {
-			http.Error(w, "message_id must be greater than 0", http.StatusBadRequest)
+		if req.Height == 0 && req.MessageID <= 0 {
+			http.Error(w, "height or message_id must be provided", http.StatusBadRequest)
 			return
 		}
 
-		message, err := s.GetMessage(ctx, req.MessageID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("get message: %v", err), http.StatusNotFound)
-			return
+		messageID := req.MessageID
+		var message store.MessageRecord
+		var err error
+		if req.Height > 0 {
+			message, err = s.GetLatestMessageByHeightAndType(ctx, req.Height, model.MessageTypeProve)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("get message by height: %v", err), http.StatusInternalServerError)
+				return
+			}
+			if message.ID == 0 {
+				http.Error(w, fmt.Sprintf("prove message not found for height %d", req.Height), http.StatusNotFound)
+				return
+			}
+			messageID = message.ID
+		} else {
+			message, err = s.GetMessage(ctx, messageID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("get message: %v", err), http.StatusNotFound)
+				return
+			}
 		}
 
 		allowRebuild := isRebuildableMessageStatus(message.Status)
@@ -244,16 +261,16 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, engine 
 
 		var updated bool
 		if rebuildPayload != "" {
-			updated, err = s.ResetMessageToBuildingWithPayload(ctx, req.MessageID, rebuildPayload)
+			updated, err = s.ResetMessageToBuildingWithPayload(ctx, messageID, rebuildPayload)
 		} else {
-			updated, err = s.ResetMessageToBuilding(ctx, req.MessageID)
+			updated, err = s.ResetMessageToBuilding(ctx, messageID)
 		}
 		if err != nil {
 			http.Error(w, fmt.Sprintf("reset message: %v", err), http.StatusInternalServerError)
 			return
 		}
 		if !updated {
-			http.Error(w, fmt.Sprintf("message %d not found", req.MessageID), http.StatusNotFound)
+			http.Error(w, fmt.Sprintf("message %d not found", messageID), http.StatusNotFound)
 			return
 		}
 
@@ -261,7 +278,7 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, engine 
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(messageRebuildResponse{
 			OK:        true,
-			MessageID: req.MessageID,
+			MessageID: messageID,
 			Previous:  summarizeMessageState(message),
 		})
 	})

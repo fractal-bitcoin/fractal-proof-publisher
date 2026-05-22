@@ -750,6 +750,78 @@ func (s *Store) FindMessageByHeightAndType(ctx context.Context, height uint64, m
 	return id, nil
 }
 
+func (s *Store) GetLatestMessageByHeightAndType(ctx context.Context, height uint64, messageType model.MessageType) (MessageRecord, error) {
+	var message MessageRecord
+	var relatedHeight sql.NullInt64
+	var indexerID sql.NullString
+	var txid sql.NullString
+	var rawTxHex sql.NullString
+	var parentID sql.NullInt64
+	var confirmHeight sql.NullInt64
+	var revealTxID sql.NullString
+	var revealRawTxHex sql.NullString
+	var revealBroadcastAt sql.NullString
+	var revealConfirmHeight sql.NullInt64
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT id, type, status, payload_text, related_height, indexer_id, txid, raw_tx_hex, confirm_height, parent_message_id, reveal_txid, reveal_raw_tx_hex, reveal_broadcast_at, reveal_confirm_height
+		FROM messages
+		WHERE parent_message_id IS NULL AND related_height = ? AND type = ?
+		ORDER BY id DESC LIMIT 1
+	`, height, messageType).Scan(
+		&message.ID,
+		&message.Type,
+		&message.Status,
+		&message.PayloadText,
+		&relatedHeight,
+		&indexerID,
+		&txid,
+		&rawTxHex,
+		&confirmHeight,
+		&parentID,
+		&revealTxID,
+		&revealRawTxHex,
+		&revealBroadcastAt,
+		&revealConfirmHeight,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return MessageRecord{}, nil
+		}
+		return MessageRecord{}, fmt.Errorf("get latest message by height/type: %w", err)
+	}
+	if relatedHeight.Valid {
+		message.RelatedHeight = uint64(relatedHeight.Int64)
+	}
+	if indexerID.Valid {
+		message.IndexerID = indexerID.String
+	}
+	if txid.Valid {
+		message.TxID = txid.String
+	}
+	if rawTxHex.Valid {
+		message.RawTxHex = rawTxHex.String
+	}
+	if confirmHeight.Valid {
+		message.ConfirmHeight = uint64(confirmHeight.Int64)
+	}
+	if parentID.Valid {
+		message.ParentMessageID = parentID.Int64
+	}
+	if revealTxID.Valid {
+		message.RevealTxID = revealTxID.String
+	}
+	if revealRawTxHex.Valid {
+		message.RevealRawTxHex = revealRawTxHex.String
+	}
+	if revealBroadcastAt.Valid {
+		message.RevealBroadcastAt = revealBroadcastAt.String
+	}
+	if revealConfirmHeight.Valid {
+		message.RevealConfirmHeight = uint64(revealConfirmHeight.Int64)
+	}
+	return message, nil
+}
+
 func (s *Store) GetBlock(ctx context.Context, height uint64) (BlockRecord, error) {
 	var record BlockRecord
 	var eligibleInt int
