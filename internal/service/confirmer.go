@@ -11,7 +11,7 @@ import (
 )
 
 const progressRetryDelay = 3 * time.Second
-const progressRetryThreshold = 100
+const progressRetryThreshold = 5
 const txInputsMissingOrSpentError = "bad-txns-inputs-missingorspent"
 
 func (e *Engine) markProgressFailure() {
@@ -131,52 +131,12 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				advanced = true
 
 			case model.MessageStatusCommitSent:
-				if e.isUnisatOpenAPIMode() {
-					if e.UnisatOpenAPI == nil || strings.TrimSpace(message.TxID) == "" {
-						advanced = false
-						break
-					}
-					found, err := e.UnisatOpenAPI.HasTx(ctx, message.TxID)
-					if err != nil {
-						e.LogMessagef(message, "commit_confirm_check_failed err=%v", err)
-						e.markProgressFailure()
-						advanced = false
-						break
-					}
-					e.clearProgressFailures()
-					if !found {
-						e.LogMessagef(message, "commit_confirm_waiting reason=unisat_tx_not_visible")
-						advanced = false
-						break
-					}
-					e.LogMessagef(message, "commit_confirmed_detected source=unisat_open_api")
-					if err := e.Store.MarkMessageConfirmed(ctx, message.ID, message.RelatedHeight); err != nil {
-						return err
-					}
-					message.ConfirmHeight = message.RelatedHeight
-					message.Status = model.MessageStatusCommitConfirmed
-					advanced = true
-					break
-				}
-				if e.RPC == nil || message.TxID == "" {
+				if strings.TrimSpace(message.TxID) == "" {
 					advanced = false
 					break
 				}
-				confirmHeight, txIndex, err := e.findConfirmation(ctx, message.RelatedHeight, message.TxID)
-				if err != nil {
-					return err
-				}
-				if confirmHeight == 0 && message.Type == model.MessageTypeRegister {
-					parts := strings.Split(message.PayloadText, ",")
-					if len(parts) >= 3 {
-						_ = e.Store.SetChainState(ctx, "register_payload_seen", strconv.FormatInt(message.ID, 10))
-					}
-				}
-				if confirmHeight == 0 {
-					advanced = false
-					break
-				}
-				e.LogMessagef(message, "commit_confirmed_detected confirm_height=%d tx_index=%d", confirmHeight, txIndex)
+				confirmHeight := message.RelatedHeight
+				e.LogMessagef(message, "commit_confirm_skipped confirm_height=%d", confirmHeight)
 				if err := e.Store.MarkMessageConfirmed(ctx, message.ID, confirmHeight); err != nil {
 					return err
 				}
@@ -189,14 +149,24 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					}
 				}
 				if message.Type == model.MessageTypeRegister {
-					if err := e.Store.UpdateMessageConfirmationDetails(ctx, message.ID, confirmHeight, ""); err != nil {
-						return err
+					indexerID := strings.TrimSpace(message.IndexerID)
+					if indexerID == "" {
+						indexerID = strings.TrimSpace(e.Config.Register.IndexerID)
+					}
+					if indexerID != "" {
+						if err := e.Store.SetIndexerID(ctx, indexerID); err != nil {
+							return err
+						}
+						if err := e.Store.UpdateMessageConfirmationDetails(ctx, message.ID, confirmHeight, indexerID); err != nil {
+							return err
+						}
+						message.IndexerID = indexerID
 					}
 					message.RelatedHeight = confirmHeight
 				}
 				message.ConfirmHeight = confirmHeight
 				message.Status = model.MessageStatusCommitConfirmed
-				e.LogMessagef(message, "commit_confirmed_applied next_status=%s", message.Status)
+				e.LogMessagef(message, "commit_confirm_skipped_applied next_status=%s", message.Status)
 				advanced = true
 
 			case model.MessageStatusCommitConfirmed:
@@ -242,81 +212,26 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				advanced = true
 
 			case model.MessageStatusRevealSent:
-				if e.isUnisatOpenAPIMode() {
-					if e.UnisatOpenAPI == nil || strings.TrimSpace(message.RevealTxID) == "" {
-						advanced = false
-						break
-					}
-					found, err := e.UnisatOpenAPI.HasTx(ctx, message.RevealTxID)
-					if err != nil {
-						e.LogMessagef(message, "reveal_confirm_check_failed err=%v", err)
-						e.markProgressFailure()
-						advanced = false
-						break
-					}
-					e.clearProgressFailures()
-					if !found {
-						e.LogMessagef(message, "reveal_confirm_waiting reason=unisat_tx_not_visible retry_push=true")
-						txid, err := e.BroadcastReveal(ctx, message.ID)
-						if err != nil {
-							e.LogMessagef(message, "reveal_rebroadcast_failed err=%v", err)
-							e.markProgressFailure()
-							advanced = false
-							break
-						}
-						e.clearProgressFailures()
-						message.RevealTxID = txid
-						message.RevealBroadcastAt = "sent"
-						e.LogMessagef(message, "reveal_rebroadcast_succeeded txid=%s", txid)
-						advanced = false
-						break
-					}
-					e.LogMessagef(message, "reveal_confirmed_detected source=unisat_open_api")
-					if err := e.Store.MarkRevealConfirmed(ctx, message.ID, message.RelatedHeight); err != nil {
-						return err
-					}
-					if message.Type == model.MessageTypeRegister {
-						indexerID := strings.TrimSpace(message.IndexerID)
-						if indexerID == "" {
-							indexerID = strings.TrimSpace(e.Config.Register.IndexerID)
-						}
-						if indexerID != "" {
-							if err := e.Store.SetIndexerID(ctx, indexerID); err != nil {
-								return err
-							}
-							if err := e.Store.UpdateMessageConfirmationDetails(ctx, message.ID, message.RelatedHeight, indexerID); err != nil {
-								return err
-							}
-							message.IndexerID = indexerID
-						}
-					}
-					message.RevealConfirmHeight = message.RelatedHeight
-					message.Status = model.MessageStatusDone
-					advanced = true
-					break
-				}
-				if e.RPC == nil || message.RevealTxID == "" || message.RevealBroadcastAt == "" || message.RevealConfirmHeight != 0 {
+				if strings.TrimSpace(message.RevealTxID) == "" || message.RevealBroadcastAt == "" || message.RevealConfirmHeight != 0 {
 					advanced = false
 					break
 				}
-				confirmHeight, txIndex, err := e.findConfirmation(ctx, message.RelatedHeight, message.RevealTxID)
-				if err != nil {
-					return err
-				}
-				if confirmHeight == 0 {
-					advanced = false
-					break
-				}
-				e.LogMessagef(message, "reveal_confirmed_detected confirm_height=%d tx_index=%d", confirmHeight, txIndex)
-				if err := e.Store.MarkRevealConfirmed(ctx, message.ID, confirmHeight); err != nil {
-					return err
-				}
-				if !e.isUnisatOpenAPIMode() {
-					if err := e.Store.MarkChangeUTXOsConfirmedByTxID(ctx, message.ID, message.RevealTxID, confirmHeight); err != nil {
-						return err
-					}
-				}
+				confirmHeight := message.RelatedHeight
 				if message.Type == model.MessageTypeRegister {
+					if e.RPC == nil {
+						advanced = false
+						break
+					}
+					locatedHeight, txIndex, err := e.findConfirmation(ctx, message.RelatedHeight, message.RevealTxID)
+					if err != nil {
+						return err
+					}
+					if locatedHeight == 0 {
+						advanced = false
+						break
+					}
+					confirmHeight = locatedHeight
+					e.LogMessagef(message, "register_reveal_located confirm_height=%d tx_index=%d", confirmHeight, txIndex)
 					indexerID := fmt.Sprintf("%d:%d", confirmHeight, txIndex)
 					if err := e.Store.SetIndexerID(ctx, indexerID); err != nil {
 						return err
@@ -326,10 +241,20 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 					}
 					message.IndexerID = indexerID
 					message.RelatedHeight = confirmHeight
+				} else {
+					e.LogMessagef(message, "reveal_confirm_skipped confirm_height=%d", confirmHeight)
+				}
+				if err := e.Store.MarkRevealConfirmed(ctx, message.ID, confirmHeight); err != nil {
+					return err
+				}
+				if !e.isUnisatOpenAPIMode() {
+					if err := e.Store.MarkChangeUTXOsConfirmedByTxID(ctx, message.ID, message.RevealTxID, confirmHeight); err != nil {
+						return err
+					}
 				}
 				message.RevealConfirmHeight = confirmHeight
 				message.Status = model.MessageStatusDone
-				e.LogMessagef(message, "reveal_confirmed_applied next_status=%s", message.Status)
+				e.LogMessagef(message, "reveal_confirm_applied next_status=%s", message.Status)
 				advanced = true
 			}
 
@@ -337,7 +262,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 				break
 			}
 		}
-		if message.Type == model.MessageTypeProve && message.Status != model.MessageStatusDone && !e.ProgressRetryAt.IsZero() {
+		if message.Type == model.MessageTypeProve && message.Status != model.MessageStatusDone {
 			e.LogMessagef(message, "progress_blocking_next_prove status=%s", message.Status)
 			break
 		}

@@ -87,7 +87,7 @@ func TestConfirmOnceKeepsBroadcastedMessageWhenTxNotInBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage() error = %v", err)
 	}
-	if message.Status != "commit_sent" {
-		t.Fatalf("message status = %q, want commit_sent", message.Status)
+	if message.Status != "commit_confirmed" {
+		t.Fatalf("message status = %q, want commit_confirmed", message.Status)
 	}
 }

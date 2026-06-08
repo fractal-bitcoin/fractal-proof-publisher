@@ -84,18 +84,18 @@ func TestConfirmProveWritesRevealAuditContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage() error = %v", err)
 	}
-	if message.Status != model.MessageStatusRevealSent {
-		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusRevealSent)
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
 	}
 	if message.RevealTxID != "revealtxid" {
 		t.Fatalf("reveal txid = %q, want revealtxid", message.RevealTxID)
 	}
-	if message.RevealConfirmHeight != 0 {
-		t.Fatalf("reveal confirm height = %d, want 0", message.RevealConfirmHeight)
+	if message.RevealConfirmHeight != height {
+		t.Fatalf("reveal confirm height = %d, want %d", message.RevealConfirmHeight, height)
 	}
 }
 
-func TestProgressOnceBlocksLaterProvesAndBacksOffAfterTenFailures(t *testing.T) {
+func TestProgressOnceBlocksLaterProvesAndBacksOffAfterFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "progress-prove-backoff.db")
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -133,20 +133,20 @@ func TestProgressOnceBlocksLaterProvesAndBacksOffAfterTenFailures(t *testing.T) 
 		},
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < progressRetryThreshold; i++ {
 		if err := engine.ProgressOnce(ctx); err != nil {
 			t.Fatalf("ProgressOnce() attempt %d error = %v", i+1, err)
 		}
 	}
-	if availableUTXORequests != 10 {
-		t.Fatalf("available UTXO requests after 10 failures = %d, want 10", availableUTXORequests)
+	if availableUTXORequests != progressRetryThreshold {
+		t.Fatalf("available UTXO requests after failures = %d, want %d", availableUTXORequests, progressRetryThreshold)
 	}
 
 	if err := engine.ProgressOnce(ctx); err != nil {
 		t.Fatalf("ProgressOnce() backoff attempt error = %v", err)
 	}
-	if availableUTXORequests != 10 {
-		t.Fatalf("available UTXO requests during backoff = %d, want 10", availableUTXORequests)
+	if availableUTXORequests != progressRetryThreshold {
+		t.Fatalf("available UTXO requests during backoff = %d, want %d", availableUTXORequests, progressRetryThreshold)
 	}
 }
 
@@ -483,7 +483,7 @@ func TestConfirmOnceSkipsWaitingForConfirmationInUnisatMode(t *testing.T) {
 	}
 }
 
-func TestConfirmOnceWaitsForUnisatCommitVisibilityBeforeReveal(t *testing.T) {
+func TestConfirmOnceSkipsUnisatCommitVisibilityBeforeReveal(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "unisat-commit-wait.db")
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -531,18 +531,18 @@ func TestConfirmOnceWaitsForUnisatCommitVisibilityBeforeReveal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage() error = %v", err)
 	}
-	if message.Status != model.MessageStatusCommitSent {
-		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusCommitSent)
+	if message.Status != model.MessageStatusCommitConfirmed {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusCommitConfirmed)
 	}
 	if message.RevealBroadcastAt != "" {
 		t.Fatalf("reveal broadcast at = %q, want empty", message.RevealBroadcastAt)
 	}
-	if revealPushCount != 0 {
-		t.Fatalf("reveal push count = %d, want 0", revealPushCount)
+	if revealPushCount != 1 {
+		t.Fatalf("reveal push count = %d, want 1", revealPushCount)
 	}
 }
 
-func TestConfirmOnceRebroadcastsRevealWhenUnisatTxNotVisible(t *testing.T) {
+func TestConfirmOnceMarksRevealDoneWhenUnisatTxVisibilityIsSkipped(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "unisat-reveal-wait.db")
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -596,11 +596,11 @@ func TestConfirmOnceRebroadcastsRevealWhenUnisatTxNotVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage() error = %v", err)
 	}
-	if message.Status != model.MessageStatusRevealSent {
-		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusRevealSent)
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
 	}
-	if pushCount != 1 {
-		t.Fatalf("push count = %d, want 1", pushCount)
+	if pushCount != 0 {
+		t.Fatalf("push count = %d, want 0", pushCount)
 	}
 }
 
@@ -760,7 +760,7 @@ func TestConfirmOnceRebuildsWhenCommitBroadcastInputsMissing(t *testing.T) {
 	}
 }
 
-func TestProgressOnceBacksOffAfterTenCommitConfirmCheckFailures(t *testing.T) {
+func TestProgressOnceBacksOffAfterRevealBroadcastFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "commit-confirm-check-backoff.db")
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -781,13 +781,13 @@ func TestProgressOnceBacksOffAfterTenCommitConfirmCheckFailures(t *testing.T) {
 		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
 	}
 
-	var txLookupCount int
+	var revealPushCount int
 	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/indexer/tx/"):
-			txLookupCount++
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			revealPushCount++
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"code":-1,"msg":"get tx failed","data":null}`))
+			_, _ = w.Write([]byte(`{"code":-1,"msg":"push reveal failed","data":null}`))
 		default:
 			w.WriteHeader(http.StatusBadRequest)
 		}
@@ -800,19 +800,19 @@ func TestProgressOnceBacksOffAfterTenCommitConfirmCheckFailures(t *testing.T) {
 		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < progressRetryThreshold; i++ {
 		if err := engine.ProgressOnce(ctx); err != nil {
 			t.Fatalf("ProgressOnce() attempt %d error = %v", i+1, err)
 		}
 	}
-	if txLookupCount != 10 {
-		t.Fatalf("tx lookup count after 10 failures = %d, want 10", txLookupCount)
+	if revealPushCount != progressRetryThreshold {
+		t.Fatalf("reveal push count after failures = %d, want %d", revealPushCount, progressRetryThreshold)
 	}
 
 	if err := engine.ProgressOnce(ctx); err != nil {
 		t.Fatalf("ProgressOnce() backoff attempt error = %v", err)
 	}
-	if txLookupCount != 10 {
-		t.Fatalf("tx lookup count during backoff = %d, want 10", txLookupCount)
+	if revealPushCount != progressRetryThreshold {
+		t.Fatalf("reveal push count during backoff = %d, want %d", revealPushCount, progressRetryThreshold)
 	}
 }
