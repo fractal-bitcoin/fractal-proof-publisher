@@ -89,37 +89,60 @@ func (e *Engine) setLastScannedHeight(ctx context.Context, height uint64) error 
 	return e.Store.SetChainState(ctx, "last_scanned_height", strconv.FormatUint(height, 10))
 }
 
+func scanFloorHeight(tip uint64) uint64 {
+	if tip > 1000 {
+		return tip - 1000
+	}
+	return 0
+}
+
+func maxScanHeight(values ...uint64) uint64 {
+	var max uint64
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
+}
+
+func (e *Engine) initialScanStart(ctx context.Context, tip uint64, lastScannedText string) (uint64, error) {
+	configuredStart := e.Config.Scan.StartHeight
+	if lastScannedText != "" || configuredStart != 0 {
+		start := maxScanHeight(scanFloorHeight(tip), configuredStart)
+		if lastScannedText != "" {
+			lastScanned, err := strconv.ParseUint(lastScannedText, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse last_scanned_height: %w", err)
+			}
+			start = maxScanHeight(start, lastScanned)
+		}
+		return start, nil
+	}
+
+	latestRegister, err := e.Store.GetLatestMessageByType(ctx, model.MessageTypeRegister, model.MessageStatusDone)
+	if err != nil {
+		return 0, err
+	}
+	if latestRegister.ID != 0 {
+		return maxScanHeight(tip, latestRegister.RelatedHeight), nil
+	}
+	return tip, nil
+}
+
 func (e *Engine) ScanOnce(ctx context.Context) error {
 	tip, err := e.RPC.GetBlockCount(ctx)
 	if err != nil {
 		return fmt.Errorf("get block count: %w", err)
 	}
 
-	start := e.Config.Scan.StartHeight
 	lastScannedText, err := e.Store.GetChainState(ctx, "last_scanned_height")
 	if err != nil {
 		return err
 	}
-	if lastScannedText != "" {
-		lastScanned, err := strconv.ParseUint(lastScannedText, 10, 64)
-		if err != nil {
-			return fmt.Errorf("parse last_scanned_height: %w", err)
-		}
-		if lastScanned >= start {
-			start = lastScanned + 1
-		}
-		if e.Config.Scan.MaxReorgDepth > 0 {
-			rewind := uint64(0)
-			if lastScanned+1 > e.Config.Scan.MaxReorgDepth {
-				rewind = lastScanned + 1 - e.Config.Scan.MaxReorgDepth
-			}
-			if rewind < start {
-				start = rewind
-			}
-			if start < e.Config.Scan.StartHeight {
-				start = e.Config.Scan.StartHeight
-			}
-		}
+	start, err := e.initialScanStart(ctx, tip, lastScannedText)
+	if err != nil {
+		return err
 	}
 
 	if start > tip {

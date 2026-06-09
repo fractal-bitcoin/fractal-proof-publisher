@@ -301,6 +301,8 @@ func (e *Engine) findConfirmation(ctx context.Context, relatedHeight uint64, txi
 		return 0, -1, nil
 	}
 
+	e.Logf("find_confirmation start_height=%d end_height=%d", startHeight, endHeight)
+
 	for height := startHeight; height <= endHeight; height++ {
 		blockHash, err := e.RPC.GetBlockHash(ctx, height)
 		if err != nil {

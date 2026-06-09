@@ -162,3 +162,92 @@ func TestScanOnceDoesNotAdvanceLastScannedWhileWaitingForRegister(t *testing.T) 
 		t.Fatalf("prove message id = %d, want 0 while waiting for register", existingID)
 	}
 }
+
+func TestInitialScanStartUsesTipWhenUnconfiguredAndNoState(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-tip.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	engine := Engine{Store: s}
+	start, err := engine.initialScanStart(context.Background(), 45057, "")
+	if err != nil {
+		t.Fatalf("initialScanStart() error = %v", err)
+	}
+	if start != 45057 {
+		t.Fatalf("start = %d, want 45057", start)
+	}
+}
+
+func TestInitialScanStartUsesTipWhenUnconfiguredWithRegisterRecord(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-register.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeRegister, "payload", nil, "")
+	if err != nil {
+		t.Fatalf("CreateMessage(register) error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit", "reveal", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.UpdateMessageConfirmationDetails(ctx, messageID, 45055, "45055:5"); err != nil {
+		t.Fatalf("UpdateMessageConfirmationDetails() error = %v", err)
+	}
+	if err := s.MarkRevealConfirmed(ctx, messageID, 45055); err != nil {
+		t.Fatalf("MarkRevealConfirmed() error = %v", err)
+	}
+
+	engine := Engine{Store: s}
+	start, err := engine.initialScanStart(ctx, 45057, "")
+	if err != nil {
+		t.Fatalf("initialScanStart() error = %v", err)
+	}
+	if start != 45057 {
+		t.Fatalf("start = %d, want 45057", start)
+	}
+}
+
+func TestInitialScanStartUsesMaxFloorDBAndConfig(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-max.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	engine := Engine{
+		Store:  s,
+		Config: config.Config{Scan: config.ScanConfig{StartHeight: 1000}},
+	}
+	start, err := engine.initialScanStart(context.Background(), 45057, "43000")
+	if err != nil {
+		t.Fatalf("initialScanStart() error = %v", err)
+	}
+	if start != 44057 {
+		t.Fatalf("start = %d, want 44057", start)
+	}
+}
+
+func TestInitialScanStartUsesDBWhenGreaterThanFloorAndConfig(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-db.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	engine := Engine{
+		Store:  s,
+		Config: config.Config{Scan: config.ScanConfig{StartHeight: 1000}},
+	}
+	start, err := engine.initialScanStart(context.Background(), 45057, "44500")
+	if err != nil {
+		t.Fatalf("initialScanStart() error = %v", err)
+	}
+	if start != 44500 {
+		t.Fatalf("start = %d, want 44500", start)
+	}
+}
