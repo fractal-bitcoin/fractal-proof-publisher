@@ -113,7 +113,8 @@ func TestBuildAndSign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTextEnvelope() error = %v", err)
 	}
-	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFeeWithOpReturn(env.CommitPlan(keyMaterial.PublicKey), chaincfg.MainNetParams.Name, changeAddress, 8, []byte(payload))
+	revealMarker := []byte("FIP-101:" + protocol.OpProve + ":reveal")
+	revealVBytes, revealFeeValue, err := txbuilder.EstimateRevealFeeWithOpReturn(env.CommitPlan(keyMaterial.PublicKey), chaincfg.MainNetParams.Name, changeAddress, 8, revealMarker)
 	if err != nil {
 		t.Fatalf("EstimateRevealFeeWithOpReturn() error = %v", err)
 	}
@@ -291,6 +292,97 @@ func TestBuildAndSign(t *testing.T) {
 
 	if storedMessage.RevealConfirmHeight != 0 {
 		t.Fatalf("reveal confirm height = %d, want 0 before reveal confirmation", storedMessage.RevealConfirmHeight)
+	}
+}
+
+func TestBuildAndSignSkipsDustSizedUTXOSelection(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dust-selection.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	keyMaterial, err := keys.Load("", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	seedScript, err := keyMaterial.P2WPKHScript(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("P2WPKHScript() error = %v", err)
+	}
+	changeAddress, err := keyMaterial.Address(&chaincfg.MainNetParams, "p2tr")
+	if err != nil {
+		t.Fatalf("Address() error = %v", err)
+	}
+	changeScript, err := txbuilder.ScriptPubKeyHexForAddress(changeAddress, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("ScriptPubKeyHexForAddress() error = %v", err)
+	}
+	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"blockhash":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","statehash":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}`))
+	}))
+	defer stateServer.Close()
+
+	if err := s.SeedInitialUTXOs(ctx, []config.InitialUTXO{{
+		TxID:         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+		Vout:         0,
+		AmountSat:    5000,
+		Address:      "bc1qtest",
+		ScriptPubKey: hex.EncodeToString(seedScript),
+		AddressType:  "p2wpkh",
+	}}); err != nil {
+		t.Fatalf("SeedInitialUTXOs() error = %v", err)
+	}
+	if err := s.InsertChangeUTXO(ctx, 0, model.UTXO{
+		TxID:         "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+		Vout:         0,
+		AmountSat:    txbuilder.DefaultRevealPostage,
+		Address:      changeAddress,
+		ScriptPubKey: changeScript,
+		AddressType:  "p2tr",
+		Status:       model.UTXOStatusAvailable,
+		Source:       model.UTXOSourceChange,
+	}); err != nil {
+		t.Fatalf("InsertChangeUTXO() error = %v", err)
+	}
+
+	engine := Engine{
+		Store:    s,
+		StateAPI: stateapi.New(stateServer.URL, "", time.Second, ""),
+		Config: config.Config{
+			BitcoinRPC: config.BitcoinRPCConfig{Network: chaincfg.MainNetParams.Name},
+			Signing:    config.SigningConfig{ChangeAddress: changeAddress},
+			FeeAPI:     config.FeeAPIConfig{FixedFeeRateSatVB: 1},
+			Tx:         config.TxConfig{SendChangeMinValue: 546},
+			Runtime:    config.RuntimeConfig{DisableBroadcast: true},
+		},
+		KeyMaterial: keyMaterial,
+	}
+
+	messageID, payload, err := engine.BuildProveMessage(ctx, 100, "100:1")
+	if err != nil {
+		t.Fatalf("BuildProveMessage() error = %v", err)
+	}
+	if _, err := engine.BuildAndSign(ctx, messageID, payload); err != nil {
+		t.Fatalf("BuildAndSign() error = %v", err)
+	}
+
+	var dustStatus string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM utxos WHERE txid = ?`, "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").Scan(&dustStatus); err != nil {
+		t.Fatalf("query dust status error = %v", err)
+	}
+	if dustStatus != string(model.UTXOStatusAvailable) {
+		t.Fatalf("dust utxo status = %q, want %q", dustStatus, model.UTXOStatusAvailable)
+	}
+
+	var selectedAmount int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT amount_sat FROM utxos WHERE reserved_by_message_id = ? AND status = ?`, messageID, model.UTXOStatusPending).Scan(&selectedAmount); err != nil {
+		t.Fatalf("query selected utxo error = %v", err)
+	}
+	if selectedAmount <= txbuilder.DefaultRevealPostage {
+		t.Fatalf("selected utxo amount = %d, want > %d", selectedAmount, txbuilder.DefaultRevealPostage)
 	}
 }
 

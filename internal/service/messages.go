@@ -78,6 +78,7 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 	if err != nil {
 		return "", err
 	}
+	available = filterSpendableUTXOs(available)
 	if len(available) == 0 {
 		return "", fmt.Errorf("no available utxos")
 	}
@@ -222,6 +223,17 @@ func (e *Engine) BuildAndSign(ctx context.Context, messageID int64, payload stri
 	}
 	e.Logf("build_sign_done message_id=%d commit_txid=%s reveal_txid=%s reveal_vbytes=%d", messageID, mustBroadcastTxID(signed), revealTxID, revealVBytes)
 	return signed, nil
+}
+
+func filterSpendableUTXOs(utxos []model.UTXO) []model.UTXO {
+	filtered := utxos[:0]
+	for _, utxo := range utxos {
+		if utxo.AmountSat <= txbuilder.DefaultRevealPostage {
+			continue
+		}
+		filtered = append(filtered, utxo)
+	}
+	return filtered
 }
 
 func revealOpReturnPayload(payload string) []byte {
