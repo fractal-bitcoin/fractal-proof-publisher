@@ -13,6 +13,7 @@ import (
 const progressRetryDelay = 3 * time.Second
 const progressRetryThreshold = 5
 const txInputsMissingOrSpentError = "bad-txns-inputs-missingorspent"
+const txOutputsAlreadyInUTXOSetError = "transaction outputs already in utxo set"
 
 func (e *Engine) markProgressFailure() {
 	e.ProgressErrCount++
@@ -37,6 +38,13 @@ func isTxInputsMissingOrSpent(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), txInputsMissingOrSpentError)
+}
+
+func isTxOutputsAlreadyInUTXOSet(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), txOutputsAlreadyInUTXOSetError)
 }
 
 func (e *Engine) ConfirmOnce(ctx context.Context) error {

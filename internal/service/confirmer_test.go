@@ -760,6 +760,81 @@ func TestConfirmOnceRebuildsWhenCommitBroadcastInputsMissing(t *testing.T) {
 	}
 }
 
+func TestConfirmOnceTreatsCommitOutputsAlreadyInUTXOSetAsBroadcasted(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "commit-already-utxo.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+
+	var commitPushCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			var req struct {
+				TxHex string `json:"txHex"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			switch req.TxHex {
+			case "commit-hex":
+				commitPushCount++
+				_, _ = w.Write([]byte(`{"code":-1,"msg":"Transaction outputs already in utxo set","data":null}`))
+			case "reveal-hex":
+				_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":null}`))
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+			}
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+	if commitPushCount != 1 {
+		t.Fatalf("commit push count = %d, want 1", commitPushCount)
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
+	}
+	if message.TxID != "commit-hex" {
+		t.Fatalf("message txid = %q, want commit-hex", message.TxID)
+	}
+	if message.RawTxHex == "" {
+		t.Fatalf("message raw tx should be preserved")
+	}
+	if message.RevealTxID != "reveal-hex" {
+		t.Fatalf("message reveal txid = %q, want reveal-hex", message.RevealTxID)
+	}
+}
+
 func TestProgressOnceBacksOffAfterRevealBroadcastFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "commit-confirm-check-backoff.db")
 	s, err := store.Open(dbPath)

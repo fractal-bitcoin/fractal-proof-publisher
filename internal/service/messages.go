@@ -534,6 +534,23 @@ func (e *Engine) BroadcastSigned(ctx context.Context, messageID int64, signedHex
 	}
 	if err != nil {
 		_ = e.Store.CreateBroadcastAttempt(ctx, messageID, "commit", err.Error())
+		if isTxOutputsAlreadyInUTXOSet(err) {
+			txid, txidErr := broadcastTxID(signedHex)
+			if txidErr != nil {
+				e.Logf("commit_broadcast_duplicate_txid_failed message_id=%d err=%v original_err=%v", messageID, txidErr, err)
+				return "", err
+			}
+			if markErr := e.Store.MarkMessageBroadcasted(ctx, messageID, txid); markErr != nil {
+				return "", markErr
+			}
+			if !e.isUnisatOpenAPIMode() {
+				if markErr := e.Store.MarkReservedUTXOsSpent(ctx, messageID, txid); markErr != nil {
+					return "", markErr
+				}
+			}
+			e.Logf("commit_broadcast_already_in_utxo_set message_id=%d txid=%s", messageID, txid)
+			return txid, nil
+		}
 		e.Logf("commit_broadcast_failed message_id=%d err=%v", messageID, err)
 		return "", err
 	}
