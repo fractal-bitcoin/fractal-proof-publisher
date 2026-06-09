@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -496,6 +497,40 @@ func TestStartHealthServer(t *testing.T) {
 	}
 	if status.LastSeenTip != "42458" {
 		t.Fatalf("/status last_seen_tip = %q, want 42458", status.LastSeenTip)
+	}
+
+	messageResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:18089/admin/message?id=%d", doneID))
+	if err != nil {
+		t.Fatalf("GET /admin/message error = %v", err)
+	}
+	defer messageResp.Body.Close()
+	if messageResp.StatusCode != http.StatusOK {
+		t.Fatalf("/admin/message code = %d, want 200", messageResp.StatusCode)
+	}
+	var messageDetail messageDetailResponse
+	if err := json.NewDecoder(messageResp.Body).Decode(&messageDetail); err != nil {
+		t.Fatalf("decode /admin/message response error = %v", err)
+	}
+	if !messageDetail.OK {
+		t.Fatal("/admin/message ok = false, want true")
+	}
+	if messageDetail.Message.ID != doneID {
+		t.Fatalf("/admin/message id = %d, want %d", messageDetail.Message.ID, doneID)
+	}
+	if messageDetail.Message.Type != model.MessageTypeProve {
+		t.Fatalf("/admin/message type = %q, want %q", messageDetail.Message.Type, model.MessageTypeProve)
+	}
+	if messageDetail.Message.Status != model.MessageStatusDone {
+		t.Fatalf("/admin/message status = %q, want %q", messageDetail.Message.Status, model.MessageStatusDone)
+	}
+	if messageDetail.Message.PayloadText != "payload2" {
+		t.Fatalf("/admin/message payload_text = %q, want payload2", messageDetail.Message.PayloadText)
+	}
+	if messageDetail.Message.RevealTxID != "revealtxid" {
+		t.Fatalf("/admin/message reveal_txid = %q, want revealtxid", messageDetail.Message.RevealTxID)
+	}
+	if !messageDetail.Summary.RevealDone {
+		t.Fatal("/admin/message summary reveal_done = false, want true")
 	}
 }
 

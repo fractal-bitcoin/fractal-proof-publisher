@@ -37,6 +37,29 @@ type messageRebuildRequest struct {
 	Height    uint64 `json:"height"`
 }
 
+type messageDetailResponse struct {
+	OK      bool                `json:"ok"`
+	Message messageDetail       `json:"message"`
+	Summary messageStateSummary `json:"summary"`
+}
+
+type messageDetail struct {
+	ID                  int64               `json:"id"`
+	Type                model.MessageType   `json:"type"`
+	Status              model.MessageStatus `json:"status"`
+	PayloadText         string              `json:"payload_text"`
+	RelatedHeight       uint64              `json:"related_height,omitempty"`
+	IndexerID           string              `json:"indexer_id,omitempty"`
+	TxID                string              `json:"txid,omitempty"`
+	RawTxHex            string              `json:"raw_tx_hex,omitempty"`
+	ConfirmHeight       uint64              `json:"confirm_height,omitempty"`
+	ParentMessageID     int64               `json:"parent_message_id,omitempty"`
+	RevealTxID          string              `json:"reveal_txid,omitempty"`
+	RevealRawTxHex      string              `json:"reveal_raw_tx_hex,omitempty"`
+	RevealBroadcastAt   string              `json:"reveal_broadcast_at,omitempty"`
+	RevealConfirmHeight uint64              `json:"reveal_confirm_height,omitempty"`
+}
+
 type messageRebuildResponse struct {
 	OK        bool                `json:"ok"`
 	MessageID int64               `json:"message_id"`
@@ -204,6 +227,42 @@ func startHealthServer(ctx context.Context, addr string, s *store.Store, engine 
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+	mux.HandleFunc("/admin/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		messageIDText := strings.TrimSpace(r.URL.Query().Get("id"))
+		if messageIDText == "" {
+			http.Error(w, "id query parameter is required", http.StatusBadRequest)
+			return
+		}
+		messageID, err := strconv.ParseInt(messageIDText, 10, 64)
+		if err != nil || messageID <= 0 {
+			http.Error(w, "id query parameter must be a positive integer", http.StatusBadRequest)
+			return
+		}
+
+		message, err := s.GetMessage(ctx, messageID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("get message: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if message.ID == 0 {
+			http.Error(w, fmt.Sprintf("message %d not found", messageID), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(messageDetailResponse{
+			OK:      true,
+			Message: detailMessage(message),
+			Summary: summarizeMessageState(message),
+		})
+	})
 	mux.HandleFunc("/admin/message/rebuild", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -312,6 +371,25 @@ func isRebuildableMessageStatus(status model.MessageStatus) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func detailMessage(message store.MessageRecord) messageDetail {
+	return messageDetail{
+		ID:                  message.ID,
+		Type:                message.Type,
+		Status:              message.Status,
+		PayloadText:         message.PayloadText,
+		RelatedHeight:       message.RelatedHeight,
+		IndexerID:           message.IndexerID,
+		TxID:                message.TxID,
+		RawTxHex:            message.RawTxHex,
+		ConfirmHeight:       message.ConfirmHeight,
+		ParentMessageID:     message.ParentMessageID,
+		RevealTxID:          message.RevealTxID,
+		RevealRawTxHex:      message.RevealRawTxHex,
+		RevealBroadcastAt:   message.RevealBroadcastAt,
+		RevealConfirmHeight: message.RevealConfirmHeight,
 	}
 }
 
