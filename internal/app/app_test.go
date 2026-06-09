@@ -112,7 +112,7 @@ func TestRunModeRegisterCreatesRegisterMessage(t *testing.T) {
 	}
 	defer s.DB.Close()
 
-	message, err := s.GetLatestMessageByType(context.Background(), "register", "commit_sent")
+	message, err := s.GetLatestMessageByType(context.Background(), "register", model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed)
 	if err != nil {
 		t.Fatalf("GetLatestMessageByType() error = %v", err)
 	}
@@ -275,6 +275,115 @@ func TestRunLoopOnceSkipsScanWhenProveIsPending(t *testing.T) {
 	}
 	if existingID != 0 {
 		t.Fatalf("prove at height 101 id = %d, want 0", existingID)
+	}
+}
+
+func TestRunLoopOnceCreatesRegisterFromCurrentTipAndSkipsProveScan(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bootstrap-register-tip.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "getblockcount":
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":150,"error":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store: s,
+		RPC:   bitcoinrpc.New(rpcServer.URL, "", ""),
+		Config: config.Config{Register: config.RegisterConfig{
+			IndexRatioBP:   100,
+			RewardAddrType: "p2tr",
+			RewardAddr:     "bc1ptest",
+			Name:           "bootstrap",
+		}},
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 1 {
+		t.Fatalf("getblockcount calls = %d, want 1", getBlockCountCalls)
+	}
+	registerStartHeight, err := s.GetChainState(ctx, "register_start_height")
+	if err != nil {
+		t.Fatalf("GetChainState(register_start_height) error = %v", err)
+	}
+	if registerStartHeight != "150" {
+		t.Fatalf("register_start_height = %q, want 150", registerStartHeight)
+	}
+	message, err := s.GetLatestMessageByType(ctx, model.MessageTypeRegister, model.MessageStatusBuilding)
+	if err != nil {
+		t.Fatalf("GetLatestMessageByType(register) error = %v", err)
+	}
+	if message.ID == 0 {
+		t.Fatal("expected register message to be created")
+	}
+	if message.RelatedHeight != 150 {
+		t.Fatalf("register related_height = %d, want 150", message.RelatedHeight)
+	}
+	lastScanned, err := s.GetChainState(ctx, "last_scanned_height")
+	if err != nil {
+		t.Fatalf("GetChainState(last_scanned_height) error = %v", err)
+	}
+	if lastScanned != "" {
+		t.Fatalf("last_scanned_height = %q, want empty before register completes", lastScanned)
+	}
+}
+
+func TestRunLoopOnceSkipsProveScanWhileRegisterPending(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pending-register-blocks-prove.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	if _, err := s.CreateMessage(ctx, model.MessageTypeRegister, "payload", nil, ""); err != nil {
+		t.Fatalf("CreateMessage(register) error = %v", err)
+	}
+
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "getblockcount" {
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":151,"error":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store: s,
+		RPC:   bitcoinrpc.New(rpcServer.URL, "", ""),
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 0 {
+		t.Fatalf("getblockcount calls = %d, want 0 while register is pending", getBlockCountCalls)
 	}
 }
 

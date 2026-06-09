@@ -182,6 +182,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 		if !eligible || uint64(header.Confirmations) < e.Config.Scan.RequiredConfirmations || indexerID == "" {
 			if eligible && indexerID == "" {
 				e.Logf("scan_wait_register height=%d confirmations=%d", height, header.Confirmations)
+				continue
 			}
 			if err := e.setLastScannedHeight(ctx, height); err != nil {
 				return err

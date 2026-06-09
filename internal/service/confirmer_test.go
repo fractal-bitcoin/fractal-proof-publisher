@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -264,6 +265,101 @@ func TestConfirmOnceUpdatesRegisterIndexerIDAfterRevealConfirmation(t *testing.T
 	}
 	if message.Status != model.MessageStatusDone {
 		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
+	}
+}
+
+func TestConfirmOnceFindsRegisterRevealWhenLastScannedAdvancedPastReorgWindow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "confirm-register-reveal-backfill.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	messageID, err := s.CreateMessage(ctx, "register", "fip101,1,register_indexer,100,bc1...,name", nil, "")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "abcd", "ef01", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "deadbeef"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, 0); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+	if err := s.MarkRevealBroadcasted(ctx, messageID, "revealtxid"); err != nil {
+		t.Fatalf("MarkRevealBroadcasted() error = %v", err)
+	}
+	if err := s.SetChainState(ctx, "last_scanned_height", "120"); err != nil {
+		t.Fatalf("SetChainState() error = %v", err)
+	}
+
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params []any  `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch req.Method {
+		case "getblockhash":
+			if len(req.Params) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			height := int(req.Params[0].(float64))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"result":"blockhash%d","error":null}`, height)))
+		case "getblock":
+			if len(req.Params) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			blockHash := req.Params[0].(string)
+			if blockHash == "blockhash101" {
+				_, _ = w.Write([]byte(`{"result":{"hash":"blockhash101","height":101,"confirmations":20,"version":539361536,"tx":["revealtxid"]},"error":null}`))
+				return
+			}
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"result":{"hash":"%s","height":0,"confirmations":20,"version":539361536,"tx":[]},"error":null}`, blockHash)))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	engine := Engine{
+		Store: s,
+		RPC:   bitcoinrpc.New(rpcServer.URL, "", ""),
+		Config: config.Config{Scan: config.ScanConfig{
+			StartHeight:   100,
+			MaxReorgDepth: 6,
+		}},
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+
+	indexerID, err := s.GetChainState(ctx, "indexer_id")
+	if err != nil {
+		t.Fatalf("GetChainState(indexer_id) error = %v", err)
+	}
+	if indexerID != "101:0" {
+		t.Fatalf("indexer_id = %q, want 101:0", indexerID)
+	}
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
+	}
+	if message.RelatedHeight != 101 {
+		t.Fatalf("message related_height = %d, want 101", message.RelatedHeight)
 	}
 }
 

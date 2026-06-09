@@ -281,21 +281,7 @@ func (e *Engine) ProgressOnce(ctx context.Context) error {
 func (e *Engine) findConfirmation(ctx context.Context, relatedHeight uint64, txid string) (uint64, int, error) {
 	startHeight := relatedHeight
 	if startHeight == 0 {
-		lastScanned, err := e.Store.GetChainState(ctx, "last_scanned_height")
-		if err != nil {
-			return 0, -1, err
-		}
-		if lastScanned == "" {
-			return 0, -1, nil
-		}
-		parsed, err := strconv.ParseUint(lastScanned, 10, 64)
-		if err != nil {
-			return 0, -1, err
-		}
-		startHeight = parsed
-		if e.Config.Scan.MaxReorgDepth > 0 && parsed+1 > e.Config.Scan.MaxReorgDepth {
-			startHeight = parsed + 1 - e.Config.Scan.MaxReorgDepth
-		}
+		startHeight = e.Config.Scan.StartHeight
 	}
 
 	endHeight := startHeight
@@ -304,6 +290,15 @@ func (e *Engine) findConfirmation(ctx context.Context, relatedHeight uint64, txi
 		if parsed, parseErr := strconv.ParseUint(lastScanned, 10, 64); parseErr == nil && parsed > endHeight {
 			endHeight = parsed
 		}
+	}
+	if e.RPC != nil {
+		if tip, tipErr := e.RPC.GetBlockCount(ctx); tipErr == nil && tip > endHeight {
+			endHeight = tip
+		}
+	}
+
+	if startHeight > endHeight {
+		return 0, -1, nil
 	}
 
 	for height := startHeight; height <= endHeight; height++ {

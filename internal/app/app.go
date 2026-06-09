@@ -395,8 +395,13 @@ func runLoopOnce(ctx context.Context, engine *service.Engine) error {
 	if err := engine.ProgressOnce(ctx); err != nil {
 		return err
 	}
-	if err := ensureRegistered(ctx, engine); err != nil {
+	registered, err := ensureRegistered(ctx, engine)
+	if err != nil {
 		return err
+	}
+	if !registered {
+		engine.Logf("loop_done")
+		return nil
 	}
 	pendingProve, err := engine.Store.GetLatestMessageByType(
 		ctx,
@@ -425,46 +430,56 @@ func runLoopOnce(ctx context.Context, engine *service.Engine) error {
 	return nil
 }
 
-func ensureRegistered(ctx context.Context, engine *service.Engine) error {
+func ensureRegistered(ctx context.Context, engine *service.Engine) (bool, error) {
 	indexerID, err := engine.Store.GetChainState(ctx, "indexer_id")
 	if err != nil {
-		return err
+		return false, err
 	}
 	if strings.TrimSpace(indexerID) != "" {
 		engine.Logf("register_check indexer_id=%s already_registered=true", indexerID)
-		return nil
+		return true, nil
 	}
 
 	configuredIndexerID := strings.TrimSpace(engine.Config.Register.IndexerID)
 	if configuredIndexerID != "" {
 		if err := engine.Store.SetChainState(ctx, "indexer_id", configuredIndexerID); err != nil {
-			return err
+			return false, err
 		}
 		engine.Logf("register_check indexer_id=%s source=config skip_create=true", configuredIndexerID)
-		return nil
+		return true, nil
 	}
 
 	latest, err := engine.Store.GetLatestMessageByType(ctx, model.MessageTypeRegister, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if latest.ID != 0 {
 		engine.Logf("register_check existing_message_id=%d status=%s skip_create=true", latest.ID, latest.Status)
-		return nil
+		return latest.Status == model.MessageStatusDone && strings.TrimSpace(latest.IndexerID) != "", nil
 	}
 
 	cfg := engine.Config.Register
 	if err := validateRegisterConfig(cfg); err != nil {
-		return err
+		return false, err
 	}
-	engine.Logf("register_check creating_initial_register=true name=%s reward_addr=%s", cfg.Name, cfg.RewardAddr)
-	_, err = engine.CreateRegisterSubmission(ctx, model.RegisterData{
+	registerStartHeight, err := engine.RPC.GetBlockCount(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get block count before register: %w", err)
+	}
+	if err := engine.Store.SetChainState(ctx, "register_start_height", strconv.FormatUint(registerStartHeight, 10)); err != nil {
+		return false, err
+	}
+	engine.Logf("register_check creating_initial_register=true name=%s reward_addr=%s start_height=%d", cfg.Name, cfg.RewardAddr, registerStartHeight)
+	_, err = engine.CreateRegisterSubmissionFromHeight(ctx, model.RegisterData{
 		IndexRatioBP:   cfg.IndexRatioBP,
 		RewardAddrType: cfg.RewardAddrType,
 		RewardAddr:     cfg.RewardAddr,
 		Name:           cfg.Name,
-	})
-	return err
+	}, &registerStartHeight)
+	if err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func runRegisterOnce(ctx context.Context, engine *service.Engine) error {

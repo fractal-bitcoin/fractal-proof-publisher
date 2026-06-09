@@ -110,3 +110,55 @@ func TestScanOnceRetriesWhenStateAPIIsTemporarilyBehind(t *testing.T) {
 		t.Fatal("expected prove message to be created after state api becomes ready")
 	}
 }
+
+func TestScanOnceDoesNotAdvanceLastScannedWhileWaitingForRegister(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "scan-wait-register.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "getblockcount":
+			_, _ = w.Write([]byte(`{"result":100,"error":null}`))
+		case "getblockhash":
+			_, _ = w.Write([]byte(`{"result":"block100","error":null}`))
+		case "getblockheader":
+			_, _ = w.Write([]byte(`{"result":{"hash":"block100","height":100,"confirmations":1,"version":539361536},"error":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	engine := Engine{
+		Store:  s,
+		RPC:    bitcoinrpc.New(rpcServer.URL, "", ""),
+		Config: config.Config{Scan: config.ScanConfig{StartHeight: 100, TargetBlockVersion: 539361536, RequiredConfirmations: 1}},
+	}
+
+	if err := engine.ScanOnce(ctx); err != nil {
+		t.Fatalf("ScanOnce() error = %v", err)
+	}
+	lastScanned, err := s.GetChainState(ctx, "last_scanned_height")
+	if err != nil {
+		t.Fatalf("GetChainState(last_scanned_height) error = %v", err)
+	}
+	if lastScanned != "" {
+		t.Fatalf("last_scanned_height = %q, want empty while waiting for register", lastScanned)
+	}
+	existingID, err := s.FindMessageByHeightAndType(ctx, 100, model.MessageTypeProve)
+	if err != nil {
+		t.Fatalf("FindMessageByHeightAndType() error = %v", err)
+	}
+	if existingID != 0 {
+		t.Fatalf("prove message id = %d, want 0 while waiting for register", existingID)
+	}
+}

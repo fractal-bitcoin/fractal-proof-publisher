@@ -19,11 +19,15 @@ import (
 )
 
 func (e *Engine) BuildRegisterMessage(ctx context.Context, data model.RegisterData) (int64, string, error) {
+	return e.BuildRegisterMessageFromHeight(ctx, data, nil)
+}
+
+func (e *Engine) BuildRegisterMessageFromHeight(ctx context.Context, data model.RegisterData, relatedHeight *uint64) (int64, string, error) {
 	payload, err := protocol.EncodeRegisterText(data)
 	if err != nil {
 		return 0, "", err
 	}
-	messageID, err := e.Store.CreateMessage(ctx, model.MessageTypeRegister, string(payload), nil, "")
+	messageID, err := e.Store.CreateMessage(ctx, model.MessageTypeRegister, string(payload), relatedHeight, "")
 	if err != nil {
 		return 0, "", err
 	}

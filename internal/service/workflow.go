@@ -53,7 +53,11 @@ func (e *Engine) RunProve(ctx context.Context, height uint64, indexerID string) 
 }
 
 func (e *Engine) CreateRegisterSubmission(ctx context.Context, data model.RegisterData) (int64, error) {
-	messageID, _, err := e.BuildRegisterMessage(ctx, data)
+	return e.CreateRegisterSubmissionFromHeight(ctx, data, nil)
+}
+
+func (e *Engine) CreateRegisterSubmissionFromHeight(ctx context.Context, data model.RegisterData, relatedHeight *uint64) (int64, error) {
+	messageID, _, err := e.BuildRegisterMessageFromHeight(ctx, data, relatedHeight)
 	return messageID, err
 }
 
