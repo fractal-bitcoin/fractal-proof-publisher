@@ -661,3 +661,68 @@ func TestSignRejectsMismatchedP2TRScript(t *testing.T) {
 		t.Fatal("expected Sign() to fail for mismatched p2tr script")
 	}
 }
+
+func TestBuildRevealTxCanCarryOpReturnPayload(t *testing.T) {
+	keyMaterial, err := keys.Load("", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	addr, err := keyMaterial.Address(mainnetParams(), "p2wpkh")
+	if err != nil {
+		t.Fatalf("Address() error = %v", err)
+	}
+	pkHashScript, err := p2wpkhScript(keyMaterial)
+	if err != nil {
+		t.Fatalf("p2wpkhScript() error = %v", err)
+	}
+	payload := []byte("fip101,1,submit_proof,100:1,100,00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	env, err := inscription.NewTextEnvelope(payload)
+	if err != nil {
+		t.Fatalf("NewTextEnvelope() error = %v", err)
+	}
+	unsigned, err := Build(BuildInput{
+		Inputs: []model.UTXO{{
+			TxID:         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+			Vout:         0,
+			AmountSat:    5000,
+			Address:      addr,
+			ScriptPubKey: hex.EncodeToString(pkHashScript),
+			AddressType:  "p2wpkh",
+		}},
+		ChangeAddress:     addr,
+		CommitPlan:        env.CommitPlan(keyMaterial.PublicKey),
+		FeeRateSatVB:      2,
+		CommitOutputValue: 1000,
+		ChangeValue:       3000,
+		RevealOutputValue: 700,
+		RevealRecipient:   addr,
+		RevealOpReturn:    payload,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(unsigned.Reveal.Tx.TxOut) != 2 {
+		t.Fatalf("Reveal.Tx outputs = %d, want 2", len(unsigned.Reveal.Tx.TxOut))
+	}
+	if unsigned.Reveal.TxOut == nil {
+		t.Fatal("Reveal.TxOut is nil")
+	}
+	if unsigned.Reveal.OpReturnTxOut == nil {
+		t.Fatal("Reveal.OpReturnTxOut is nil")
+	}
+	if unsigned.Reveal.OpReturnTxOut.Value != DefaultOpReturnValue {
+		t.Fatalf("Reveal.OpReturnTxOut.Value = %d, want %d", unsigned.Reveal.OpReturnTxOut.Value, DefaultOpReturnValue)
+	}
+	if unsigned.Reveal.OpReturnTxOut.PkScript[0] != txscript.OP_RETURN {
+		t.Fatalf("Reveal.OpReturnTxOut.PkScript[0] = %x, want OP_RETURN", unsigned.Reveal.OpReturnTxOut.PkScript[0])
+	}
+	if !bytes.Contains(unsigned.Reveal.OpReturnTxOut.PkScript, payload) {
+		t.Fatal("Reveal.OpReturnTxOut.PkScript does not contain payload")
+	}
+	if unsigned.Reveal.TxOut.Value != 700 {
+		t.Fatalf("Reveal.TxOut.Value = %d, want 700", unsigned.Reveal.TxOut.Value)
+	}
+	if unsigned.Reveal.FeeValue != 299 {
+		t.Fatalf("Reveal.FeeValue = %d, want 299", unsigned.Reveal.FeeValue)
+	}
+}

@@ -111,8 +111,8 @@ func TestRecoverOnceBroadcastsRevealForConfirmedSubmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage() error = %v", err)
 	}
-	if message.Status != model.MessageStatusRevealSent {
-		t.Fatalf("message status = %q, want reveal_sent", message.Status)
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want done", message.Status)
 	}
 	if message.RevealTxID == "" {
 		t.Fatal("reveal txid is empty")

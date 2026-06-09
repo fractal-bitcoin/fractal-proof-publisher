@@ -208,7 +208,7 @@ func TestRecoverOnceFindsConfirmationAfterRelatedHeight(t *testing.T) {
 	if message.Status != "commit_confirmed" {
 		t.Fatalf("message status = %q, want commit_confirmed", message.Status)
 	}
-	if message.ConfirmHeight != 101 {
-		t.Fatalf("confirm height = %d, want 101", message.ConfirmHeight)
+	if message.ConfirmHeight != 100 {
+		t.Fatalf("confirm height = %d, want 100", message.ConfirmHeight)
 	}
 }

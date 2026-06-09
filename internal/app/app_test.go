@@ -1,19 +1,28 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"fractal-proof-publisher/internal/bitcoinrpc"
 	"fractal-proof-publisher/internal/config"
+	"fractal-proof-publisher/internal/feeapi"
 	"fractal-proof-publisher/internal/keys"
+	"fractal-proof-publisher/internal/model"
+	"fractal-proof-publisher/internal/protocol"
+	"fractal-proof-publisher/internal/service"
+	"fractal-proof-publisher/internal/stateapi"
 	"fractal-proof-publisher/internal/store"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -104,7 +113,7 @@ func TestRunModeRegisterCreatesRegisterMessage(t *testing.T) {
 	}
 	defer s.DB.Close()
 
-	message, err := s.GetLatestMessageByType(context.Background(), "register", "commit_sent")
+	message, err := s.GetLatestMessageByType(context.Background(), "register", model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed)
 	if err != nil {
 		t.Fatalf("GetLatestMessageByType() error = %v", err)
 	}
@@ -213,6 +222,172 @@ func TestEnsureRegisteredUsesConfiguredIndexerID(t *testing.T) {
 	}
 }
 
+func TestRunLoopOnceSkipsScanWhenProveIsPending(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pending-prove.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	if err := s.SetChainState(ctx, "indexer_id", "100:1"); err != nil {
+		t.Fatalf("SetChainState(indexer_id) error = %v", err)
+	}
+	pendingHeight := uint64(100)
+	if _, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &pendingHeight, "100:1"); err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "getblockcount" {
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":101,"error":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store:    s,
+		RPC:      bitcoinrpc.New(rpcServer.URL, "", ""),
+		FeeAPI:   feeapi.New(rpcServer.URL, time.Second),
+		StateAPI: stateapi.New(rpcServer.URL, "", time.Second, ""),
+		Config: config.Config{
+			Scan: config.ScanConfig{StartHeight: 101, TargetBlockVersion: 539361536, RequiredConfirmations: 1},
+		},
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 0 {
+		t.Fatalf("getblockcount calls = %d, want 0 when pending prove blocks scan", getBlockCountCalls)
+	}
+	existingID, err := s.FindMessageByHeightAndType(ctx, 101, model.MessageTypeProve)
+	if err != nil {
+		t.Fatalf("FindMessageByHeightAndType() error = %v", err)
+	}
+	if existingID != 0 {
+		t.Fatalf("prove at height 101 id = %d, want 0", existingID)
+	}
+}
+
+func TestRunLoopOnceCreatesRegisterFromCurrentTipAndSkipsProveScan(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bootstrap-register-tip.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "getblockcount":
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":150,"error":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store: s,
+		RPC:   bitcoinrpc.New(rpcServer.URL, "", ""),
+		Config: config.Config{Register: config.RegisterConfig{
+			IndexRatioBP:   100,
+			RewardAddrType: "p2tr",
+			RewardAddr:     "bc1ptest",
+			Name:           "bootstrap",
+		}},
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 1 {
+		t.Fatalf("getblockcount calls = %d, want 1", getBlockCountCalls)
+	}
+	registerStartHeight, err := s.GetChainState(ctx, "register_start_height")
+	if err != nil {
+		t.Fatalf("GetChainState(register_start_height) error = %v", err)
+	}
+	if registerStartHeight != "150" {
+		t.Fatalf("register_start_height = %q, want 150", registerStartHeight)
+	}
+	message, err := s.GetLatestMessageByType(ctx, model.MessageTypeRegister, model.MessageStatusBuilding)
+	if err != nil {
+		t.Fatalf("GetLatestMessageByType(register) error = %v", err)
+	}
+	if message.ID == 0 {
+		t.Fatal("expected register message to be created")
+	}
+	if message.RelatedHeight != 150 {
+		t.Fatalf("register related_height = %d, want 150", message.RelatedHeight)
+	}
+	lastScanned, err := s.GetChainState(ctx, "last_scanned_height")
+	if err != nil {
+		t.Fatalf("GetChainState(last_scanned_height) error = %v", err)
+	}
+	if lastScanned != "" {
+		t.Fatalf("last_scanned_height = %q, want empty before register completes", lastScanned)
+	}
+}
+
+func TestRunLoopOnceSkipsProveScanWhileRegisterPending(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pending-register-blocks-prove.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	if _, err := s.CreateMessage(ctx, model.MessageTypeRegister, "payload", nil, ""); err != nil {
+		t.Fatalf("CreateMessage(register) error = %v", err)
+	}
+
+	var getBlockCountCalls int
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "getblockcount" {
+			getBlockCountCalls++
+			_, _ = w.Write([]byte(`{"result":151,"error":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer rpcServer.Close()
+
+	engine := service.Engine{
+		Store: s,
+		RPC:   bitcoinrpc.New(rpcServer.URL, "", ""),
+	}
+
+	if err := runLoopOnce(ctx, &engine); err != nil {
+		t.Fatalf("runLoopOnce() error = %v", err)
+	}
+	if getBlockCountCalls != 0 {
+		t.Fatalf("getblockcount calls = %d, want 0 while register is pending", getBlockCountCalls)
+	}
+}
+
 func TestStartHealthServer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -251,7 +426,7 @@ func TestStartHealthServer(t *testing.T) {
 		t.Fatalf("MarkRevealConfirmed() error = %v", err)
 	}
 
-	if err := startHealthServer(ctx, "127.0.0.1:18089", s, "run"); err != nil {
+	if err := startHealthServer(ctx, "127.0.0.1:18089", s, nil, "run"); err != nil {
 		t.Fatalf("startHealthServer() error = %v", err)
 	}
 
@@ -322,5 +497,334 @@ func TestStartHealthServer(t *testing.T) {
 	}
 	if status.LastSeenTip != "42458" {
 		t.Fatalf("/status last_seen_tip = %q, want 42458", status.LastSeenTip)
+	}
+
+	messageResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:18089/admin/message?id=%d", doneID))
+	if err != nil {
+		t.Fatalf("GET /admin/message error = %v", err)
+	}
+	defer messageResp.Body.Close()
+	if messageResp.StatusCode != http.StatusOK {
+		t.Fatalf("/admin/message code = %d, want 200", messageResp.StatusCode)
+	}
+	var messageDetail messageDetailResponse
+	if err := json.NewDecoder(messageResp.Body).Decode(&messageDetail); err != nil {
+		t.Fatalf("decode /admin/message response error = %v", err)
+	}
+	if !messageDetail.OK {
+		t.Fatal("/admin/message ok = false, want true")
+	}
+	if messageDetail.Message.ID != doneID {
+		t.Fatalf("/admin/message id = %d, want %d", messageDetail.Message.ID, doneID)
+	}
+	if messageDetail.Message.Type != model.MessageTypeProve {
+		t.Fatalf("/admin/message type = %q, want %q", messageDetail.Message.Type, model.MessageTypeProve)
+	}
+	if messageDetail.Message.Status != model.MessageStatusDone {
+		t.Fatalf("/admin/message status = %q, want %q", messageDetail.Message.Status, model.MessageStatusDone)
+	}
+	if messageDetail.Message.PayloadText != "payload2" {
+		t.Fatalf("/admin/message payload_text = %q, want payload2", messageDetail.Message.PayloadText)
+	}
+	if messageDetail.Message.RevealTxID != "revealtxid" {
+		t.Fatalf("/admin/message reveal_txid = %q, want revealtxid", messageDetail.Message.RevealTxID)
+	}
+	if !messageDetail.Summary.RevealDone {
+		t.Fatal("/admin/message summary reveal_done = false, want true")
+	}
+}
+
+func TestMessageRebuildAdminEndpointResetsMessageOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	if err := s.SetChainState(ctx, "last_scanned_height", "1764271"); err != nil {
+		t.Fatalf("SetChainState(last_scanned_height) error = %v", err)
+	}
+	height := uint64(1764241)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commitraw", "revealraw", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18091", s, nil, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18091/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(messageID, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 200", resp.StatusCode, string(body))
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusBuilding {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusBuilding)
+	}
+	if message.RawTxHex != "" || message.RevealRawTxHex != "" || message.RevealTxID != "" {
+		t.Fatalf("signed tx fields were not cleared: raw=%q reveal_raw=%q reveal_txid=%q", message.RawTxHex, message.RevealRawTxHex, message.RevealTxID)
+	}
+	lastScanned, err := s.GetChainState(ctx, "last_scanned_height")
+	if err != nil {
+		t.Fatalf("GetChainState(last_scanned_height) error = %v", err)
+	}
+	if lastScanned != "1764271" {
+		t.Fatalf("last_scanned_height = %q, want unchanged 1764271", lastScanned)
+	}
+}
+
+func TestMessageRebuildAdminEndpointDoneProveRejectsWhenHashUnchanged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild-done-prove-unchanged.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	height := uint64(1764241)
+	hash, err := protocol.ComputeProveHash("1761438:1", "b", "a")
+	if err != nil {
+		t.Fatalf("ComputeProveHash() error = %v", err)
+	}
+	payload := "fip101,1,submit_proof,1761438:1,1764241," + hash
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, payload, &height, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, height); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+	if err := s.MarkRevealBroadcasted(ctx, messageID, "revealtxid"); err != nil {
+		t.Fatalf("MarkRevealBroadcasted() error = %v", err)
+	}
+	if err := s.MarkRevealConfirmed(ctx, messageID, height+1); err != nil {
+		t.Fatalf("MarkRevealConfirmed() error = %v", err)
+	}
+
+	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"blockhash":"b","statehash":"a"}`))
+	}))
+	defer stateServer.Close()
+
+	engine := service.Engine{
+		Store:    s,
+		StateAPI: stateapi.New(stateServer.URL, "", time.Second, ""),
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18094", s, &engine, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18094/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(messageID, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 409", resp.StatusCode, string(body))
+	}
+}
+
+func TestMessageRebuildAdminEndpointDoneProveRebuildsWhenHashChanged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild-done-prove-changed.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	height := uint64(1764242)
+	payload := "fip101,1,submit_proof,1761438:1,1764242,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, payload, &height, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, height); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+	if err := s.MarkRevealBroadcasted(ctx, messageID, "revealtxid"); err != nil {
+		t.Fatalf("MarkRevealBroadcasted() error = %v", err)
+	}
+	if err := s.MarkRevealConfirmed(ctx, messageID, height+1); err != nil {
+		t.Fatalf("MarkRevealConfirmed() error = %v", err)
+	}
+
+	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"blockhash":"different-block","statehash":"different-state"}`))
+	}))
+	defer stateServer.Close()
+
+	engine := service.Engine{
+		Store:    s,
+		StateAPI: stateapi.New(stateServer.URL, "", time.Second, ""),
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18095", s, &engine, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18095/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(messageID, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 200", resp.StatusCode, string(body))
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusBuilding {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusBuilding)
+	}
+	wantHash, err := protocol.ComputeProveHash("1761438:1", "different-block", "different-state")
+	if err != nil {
+		t.Fatalf("ComputeProveHash() error = %v", err)
+	}
+	wantPayload := "fip101,1,submit_proof,1761438:1,1764242," + wantHash
+	if message.PayloadText != wantPayload {
+		t.Fatalf("payload = %q, want %q", message.PayloadText, wantPayload)
+	}
+}
+
+func TestMessageRebuildAdminEndpointHeightTakesPrecedenceOverMessageID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "message-rebuild-height-precedence.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	otherHeight := uint64(1764200)
+	otherID, err := s.CreateMessage(ctx, model.MessageTypeProve, "other-payload", &otherHeight, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(other) error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, otherID, "other-commit", "other-reveal", "other-reveal-txid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal(other) error = %v", err)
+	}
+
+	targetHeight := uint64(1764241)
+	targetID, err := s.CreateMessage(ctx, model.MessageTypeProve, "target-payload", &targetHeight, "1761438:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(target) error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, targetID, "target-commit", "target-reveal", "target-reveal-txid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal(target) error = %v", err)
+	}
+
+	if err := startHealthServer(ctx, "127.0.0.1:18096", s, nil, "run"); err != nil {
+		t.Fatalf("startHealthServer() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Post(
+			"http://127.0.0.1:18096/admin/message/rebuild",
+			"application/json",
+			bytes.NewBufferString(`{"message_id":`+strconv.FormatInt(otherID, 10)+`,"height":`+strconv.FormatUint(targetHeight, 10)+`}`),
+		)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("POST /admin/message/rebuild error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/admin/message/rebuild code = %d body=%q, want 200", resp.StatusCode, string(body))
+	}
+
+	var rebuildResp messageRebuildResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rebuildResp); err != nil {
+		t.Fatalf("decode rebuild response error = %v", err)
+	}
+	if rebuildResp.MessageID != targetID {
+		t.Fatalf("rebuild response message_id = %d, want %d", rebuildResp.MessageID, targetID)
+	}
+
+	target, err := s.GetMessage(ctx, targetID)
+	if err != nil {
+		t.Fatalf("GetMessage(target) error = %v", err)
+	}
+	if target.Status != model.MessageStatusBuilding {
+		t.Fatalf("target status = %q, want %q", target.Status, model.MessageStatusBuilding)
+	}
+	other, err := s.GetMessage(ctx, otherID)
+	if err != nil {
+		t.Fatalf("GetMessage(other) error = %v", err)
+	}
+	if other.Status != model.MessageStatusCommitSigned {
+		t.Fatalf("other status = %q, want %q", other.Status, model.MessageStatusCommitSigned)
 	}
 }

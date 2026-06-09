@@ -16,10 +16,12 @@ import (
 
 const (
 	DefaultRevealPostage    int64 = 546
+	DefaultOpReturnValue    int64 = 1
 	DefaultSendChangeMin    int64 = 546
 	defaultCommitOverhead   int64 = 11
 	defaultP2WPKHInputVSize int64 = 68
 	defaultP2TRInputVSize   int64 = 58
+	maxScriptDataChunk      int   = 520
 )
 
 type FundingPlan struct {
@@ -41,6 +43,7 @@ type BuildInput struct {
 	ChangeValue       int64
 	RevealOutputValue int64
 	RevealRecipient   string
+	RevealOpReturn    []byte
 }
 
 type RevealPlan struct {
@@ -59,6 +62,7 @@ type RevealPlan struct {
 	CommitTxID            string
 	TxIn                  *wire.TxIn
 	TxOut                 *wire.TxOut
+	OpReturnTxOut         *wire.TxOut
 	Tx                    *wire.MsgTx
 	RawTxHex              string
 	WitnessStack          wire.TxWitness
@@ -146,6 +150,40 @@ func PlanFunding(utxos []model.UTXO, feeRateSatVB, commitOutputValue, sendChange
 	}
 }
 
+func PlanFundingWithoutCommitChange(utxos []model.UTXO, feeRateSatVB, minimumCommitOutputValue int64) (FundingPlan, error) {
+	if minimumCommitOutputValue <= 0 {
+		minimumCommitOutputValue = DefaultRevealPostage
+	}
+	if feeRateSatVB <= 0 {
+		feeRateSatVB = 1
+	}
+
+	selected, total, err := SelectInputs(utxos, minimumCommitOutputValue)
+	if err != nil {
+		return FundingPlan{}, err
+	}
+	for {
+		feeValue := estimateCommitFee(selected, feeRateSatVB, false)
+		commitOutputValue := total - feeValue
+		if commitOutputValue >= minimumCommitOutputValue {
+			return FundingPlan{
+				SelectedInputs:    selected,
+				TotalInputValue:   total,
+				EstimatedVBytes:   estimateCommitVBytes(selected, false),
+				FeeValue:          feeValue,
+				CommitOutputValue: commitOutputValue,
+				ChangeValue:       0,
+			}, nil
+		}
+		if len(utxos) <= len(selected) {
+			return FundingPlan{}, fmt.Errorf("insufficient funds: need %d", minimumCommitOutputValue+feeValue)
+		}
+		next := utxos[len(selected)]
+		selected = append(selected, next)
+		total += next.AmountSat
+	}
+}
+
 func estimateCommitFee(inputs []model.UTXO, feeRateSatVB int64, hasChange bool) int64 {
 	return estimateCommitVBytes(inputs, hasChange) * feeRateSatVB
 }
@@ -182,6 +220,10 @@ func estimateRevealFee(vbytes, feeRateSatVB int64) int64 {
 }
 
 func EstimateRevealFee(commitPlan inscription.CommitPlan, network, recipientAddress string, feeRateSatVB int64) (int64, int64, error) {
+	return EstimateRevealFeeWithOpReturn(commitPlan, network, recipientAddress, feeRateSatVB, nil)
+}
+
+func EstimateRevealFeeWithOpReturn(commitPlan inscription.CommitPlan, network, recipientAddress string, feeRateSatVB int64, opReturnData []byte) (int64, int64, error) {
 	if commitPlan.InternalKey == nil {
 		return 0, 0, fmt.Errorf("inscription commit plan internal key is required")
 	}
@@ -205,6 +247,11 @@ func EstimateRevealFee(commitPlan inscription.CommitPlan, network, recipientAddr
 		CommitOutputValue: DefaultRevealPostage,
 		RevealOutputValue: DefaultRevealPostage,
 		RevealRecipient:   recipientAddress,
+		RevealOpReturn:    opReturnData,
+	}
+	if len(opReturnData) > 0 {
+		revealInput.CommitOutputValue = DefaultOpReturnValue + DefaultSendChangeMin
+		revealInput.RevealOutputValue = DefaultSendChangeMin
 	}
 	revealPlan, err := buildRevealPlan(revealInput, spendPlan, commitOutputScript)
 	if err != nil {
@@ -237,14 +284,25 @@ func cloneRevealPlan(plan RevealPlan) RevealPlan {
 	if plan.TxOut != nil {
 		cloned.TxOut = &wire.TxOut{Value: plan.TxOut.Value, PkScript: append([]byte(nil), plan.TxOut.PkScript...)}
 	}
+	if plan.OpReturnTxOut != nil {
+		cloned.OpReturnTxOut = &wire.TxOut{Value: plan.OpReturnTxOut.Value, PkScript: append([]byte(nil), plan.OpReturnTxOut.PkScript...)}
+	}
 	if plan.Tx != nil {
 		clonedTx := plan.Tx.Copy()
 		cloned.Tx = clonedTx
 		if len(clonedTx.TxIn) > 0 {
 			cloned.TxIn = clonedTx.TxIn[0]
 		}
-		if len(clonedTx.TxOut) > 0 {
-			cloned.TxOut = clonedTx.TxOut[0]
+		cloned.TxOut = nil
+		cloned.OpReturnTxOut = nil
+		for _, out := range clonedTx.TxOut {
+			if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
+				cloned.OpReturnTxOut = out
+				continue
+			}
+			if cloned.TxOut == nil {
+				cloned.TxOut = out
+			}
 		}
 	}
 	return cloned
@@ -441,24 +499,33 @@ func buildRevealPlan(input BuildInput, spendPlan inscription.ScriptSpendPlan, co
 	if err != nil {
 		return RevealPlan{}, err
 	}
-	recipientAddress := input.RevealRecipient
-	if recipientAddress == "" {
-		recipientAddress = input.ChangeAddress
-	}
-	recipientAddr, err := decodeAddress(recipientAddress, input.Network)
-	if err != nil {
-		return RevealPlan{}, err
-	}
-	recipientScript, err := txscript.PayToAddrScript(recipientAddr)
-	if err != nil {
-		return RevealPlan{}, fmt.Errorf("build reveal recipient script: %w", err)
+	hasRecipientOutput := len(input.RevealOpReturn) == 0 || input.RevealOutputValue > 0
+	var recipientAddress string
+	var recipientScript []byte
+	if hasRecipientOutput {
+		recipientAddress = input.RevealRecipient
+		if recipientAddress == "" {
+			recipientAddress = input.ChangeAddress
+		}
+		recipientAddr, err := decodeAddress(recipientAddress, input.Network)
+		if err != nil {
+			return RevealPlan{}, err
+		}
+		recipientScript, err = txscript.PayToAddrScript(recipientAddr)
+		if err != nil {
+			return RevealPlan{}, fmt.Errorf("build reveal recipient script: %w", err)
+		}
 	}
 	recipientValue := input.RevealOutputValue
-	if recipientValue <= 0 {
+	if hasRecipientOutput && recipientValue <= 0 {
 		recipientValue = input.CommitOutputValue
 	}
-	if recipientValue > input.CommitOutputValue {
-		return RevealPlan{}, fmt.Errorf("reveal output value %d exceeds commit output value %d", recipientValue, input.CommitOutputValue)
+	opReturnValue := int64(0)
+	if len(input.RevealOpReturn) > 0 {
+		opReturnValue = DefaultOpReturnValue
+	}
+	if recipientValue+opReturnValue > input.CommitOutputValue {
+		return RevealPlan{}, fmt.Errorf("reveal output value %d plus opreturn value %d exceeds commit output value %d", recipientValue, opReturnValue, input.CommitOutputValue)
 	}
 	witnessStack, err := spendPlan.WitnessStack()
 	if err != nil {
@@ -474,10 +541,22 @@ func buildRevealPlan(input BuildInput, spendPlan inscription.ScriptSpendPlan, co
 	txIn := wire.NewTxIn(&commitOutPoint, nil, nil)
 	txIn.Sequence = wire.MaxTxInSequenceNum
 	txIn.Witness = append(wire.TxWitness(nil), witnessStack...)
-	txOut := wire.NewTxOut(recipientValue, append([]byte(nil), recipientScript...))
 	revealTx := wire.NewMsgTx(wire.TxVersion)
 	revealTx.AddTxIn(txIn)
-	revealTx.AddTxOut(txOut)
+	var txOut *wire.TxOut
+	var opReturnTxOut *wire.TxOut
+	if len(input.RevealOpReturn) > 0 {
+		opReturnScript, err := buildOpReturnScript(input.RevealOpReturn)
+		if err != nil {
+			return RevealPlan{}, err
+		}
+		opReturnTxOut = wire.NewTxOut(DefaultOpReturnValue, opReturnScript)
+		revealTx.AddTxOut(opReturnTxOut)
+	}
+	if hasRecipientOutput {
+		txOut = wire.NewTxOut(recipientValue, append([]byte(nil), recipientScript...))
+		revealTx.AddTxOut(txOut)
+	}
 
 	var buf bytes.Buffer
 	if err := revealTx.Serialize(&buf); err != nil {
@@ -487,7 +566,7 @@ func buildRevealPlan(input BuildInput, spendPlan inscription.ScriptSpendPlan, co
 	return RevealPlan{
 		InputValue:            input.CommitOutputValue,
 		RecipientValue:        recipientValue,
-		FeeValue:              input.CommitOutputValue - recipientValue,
+		FeeValue:              input.CommitOutputValue - recipientValue - opReturnValue,
 		RecipientAddress:      recipientAddress,
 		RecipientScript:       append([]byte(nil), recipientScript...),
 		WitnessProgram:        append([]byte(nil), witnessProgram...),
@@ -499,6 +578,7 @@ func buildRevealPlan(input BuildInput, spendPlan inscription.ScriptSpendPlan, co
 		CommitPrevOutput:      commitPrevOutput,
 		TxIn:                  txIn,
 		TxOut:                 txOut,
+		OpReturnTxOut:         opReturnTxOut,
 		Tx:                    revealTx,
 		RawTxHex:              hex.EncodeToString(buf.Bytes()),
 		WitnessStack:          witnessStack,
@@ -506,6 +586,37 @@ func buildRevealPlan(input BuildInput, spendPlan inscription.ScriptSpendPlan, co
 		EstimatedWitnessVB:    estimatedWitnessBytes,
 		EstimatedVBytes:       int64(revealTx.SerializeSize()),
 	}, nil
+}
+
+func buildOpReturnScript(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("opreturn data is required")
+	}
+	builder := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN)
+	for _, chunk := range chunkBytes(data, maxScriptDataChunk) {
+		builder.AddData(chunk)
+	}
+	script, err := builder.Script()
+	if err != nil {
+		return nil, fmt.Errorf("build opreturn script: %w", err)
+	}
+	return script, nil
+}
+
+func chunkBytes(data []byte, max int) [][]byte {
+	if max <= 0 || len(data) <= max {
+		return [][]byte{data}
+	}
+	chunks := make([][]byte, 0, (len(data)+max-1)/max)
+	for len(data) > 0 {
+		n := max
+		if len(data) < n {
+			n = len(data)
+		}
+		chunks = append(chunks, data[:n])
+		data = data[n:]
+	}
+	return chunks
 }
 
 func Sign(unsigned BuildResult, keyMaterial keys.KeyMaterial) (string, error) {

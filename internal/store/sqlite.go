@@ -750,6 +750,78 @@ func (s *Store) FindMessageByHeightAndType(ctx context.Context, height uint64, m
 	return id, nil
 }
 
+func (s *Store) GetLatestMessageByHeightAndType(ctx context.Context, height uint64, messageType model.MessageType) (MessageRecord, error) {
+	var message MessageRecord
+	var relatedHeight sql.NullInt64
+	var indexerID sql.NullString
+	var txid sql.NullString
+	var rawTxHex sql.NullString
+	var parentID sql.NullInt64
+	var confirmHeight sql.NullInt64
+	var revealTxID sql.NullString
+	var revealRawTxHex sql.NullString
+	var revealBroadcastAt sql.NullString
+	var revealConfirmHeight sql.NullInt64
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT id, type, status, payload_text, related_height, indexer_id, txid, raw_tx_hex, confirm_height, parent_message_id, reveal_txid, reveal_raw_tx_hex, reveal_broadcast_at, reveal_confirm_height
+		FROM messages
+		WHERE parent_message_id IS NULL AND related_height = ? AND type = ?
+		ORDER BY id DESC LIMIT 1
+	`, height, messageType).Scan(
+		&message.ID,
+		&message.Type,
+		&message.Status,
+		&message.PayloadText,
+		&relatedHeight,
+		&indexerID,
+		&txid,
+		&rawTxHex,
+		&confirmHeight,
+		&parentID,
+		&revealTxID,
+		&revealRawTxHex,
+		&revealBroadcastAt,
+		&revealConfirmHeight,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return MessageRecord{}, nil
+		}
+		return MessageRecord{}, fmt.Errorf("get latest message by height/type: %w", err)
+	}
+	if relatedHeight.Valid {
+		message.RelatedHeight = uint64(relatedHeight.Int64)
+	}
+	if indexerID.Valid {
+		message.IndexerID = indexerID.String
+	}
+	if txid.Valid {
+		message.TxID = txid.String
+	}
+	if rawTxHex.Valid {
+		message.RawTxHex = rawTxHex.String
+	}
+	if confirmHeight.Valid {
+		message.ConfirmHeight = uint64(confirmHeight.Int64)
+	}
+	if parentID.Valid {
+		message.ParentMessageID = parentID.Int64
+	}
+	if revealTxID.Valid {
+		message.RevealTxID = revealTxID.String
+	}
+	if revealRawTxHex.Valid {
+		message.RevealRawTxHex = revealRawTxHex.String
+	}
+	if revealBroadcastAt.Valid {
+		message.RevealBroadcastAt = revealBroadcastAt.String
+	}
+	if revealConfirmHeight.Valid {
+		message.RevealConfirmHeight = uint64(revealConfirmHeight.Int64)
+	}
+	return message, nil
+}
+
 func (s *Store) GetBlock(ctx context.Context, height uint64) (BlockRecord, error) {
 	var record BlockRecord
 	var eligibleInt int
@@ -877,6 +949,81 @@ func (s *Store) MarkMessageSignedWithReveal(ctx context.Context, messageID int64
 	return nil
 }
 
+func (s *Store) RollbackMessageToCommitSigned(ctx context.Context, messageID int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE messages
+		SET status = ?,
+			txid = NULL,
+			broadcast_at = NULL,
+			confirm_height = 0,
+			reveal_broadcast_at = NULL,
+			reveal_confirm_height = 0,
+			updated_at = ?
+		WHERE id = ? AND parent_message_id IS NULL
+	`, model.MessageStatusCommitSigned, time.Now().UTC().Format(time.RFC3339), messageID)
+	if err != nil {
+		return false, fmt.Errorf("rollback message %d to commit_signed: %w", messageID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("get rollback message row count %d: %w", messageID, err)
+	}
+	return rowsAffected > 0, nil
+}
+
+func (s *Store) ResetMessageToBuilding(ctx context.Context, messageID int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE messages
+		SET status = ?,
+			txid = NULL,
+			raw_tx_hex = NULL,
+			broadcast_at = NULL,
+			confirm_height = 0,
+			failure_reason = NULL,
+			reveal_txid = NULL,
+			reveal_raw_tx_hex = NULL,
+			reveal_broadcast_at = NULL,
+			reveal_confirm_height = 0,
+			updated_at = ?
+		WHERE id = ? AND parent_message_id IS NULL
+	`, model.MessageStatusBuilding, time.Now().UTC().Format(time.RFC3339), messageID)
+	if err != nil {
+		return false, fmt.Errorf("reset message %d to building: %w", messageID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("get reset message row count %d: %w", messageID, err)
+	}
+	return rowsAffected > 0, nil
+}
+
+func (s *Store) ResetMessageToBuildingWithPayload(ctx context.Context, messageID int64, payload string) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE messages
+		SET status = ?,
+			payload_text = ?,
+			txid = NULL,
+			raw_tx_hex = NULL,
+			broadcast_at = NULL,
+			confirm_height = 0,
+			failure_reason = NULL,
+			reveal_txid = NULL,
+			reveal_raw_tx_hex = NULL,
+			reveal_broadcast_at = NULL,
+			reveal_confirm_height = 0,
+			updated_at = ?
+		WHERE id = ? AND parent_message_id IS NULL
+	`, model.MessageStatusBuilding, payload, time.Now().UTC().Format(time.RFC3339), messageID)
+	if err != nil {
+		return false, fmt.Errorf("reset message %d to building with payload: %w", messageID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("get reset message row count %d: %w", messageID, err)
+	}
+	return rowsAffected > 0, nil
+}
+
 func (s *Store) MarkMessageBroadcasted(ctx context.Context, messageID int64, txid string) error {
 	_, err := s.DB.ExecContext(ctx, `
 		UPDATE messages SET status = ?, txid = ?, broadcast_at = ?, updated_at = ? WHERE id = ?
@@ -986,6 +1133,18 @@ func (s *Store) MarkChangeUTXOsConfirmed(ctx context.Context, messageID int64, c
 	`, model.UTXOStatusAvailable, confirmHeight, time.Now().UTC().Format(time.RFC3339), messageID, model.UTXOSourceChange, model.UTXOStatusPending)
 	if err != nil {
 		return fmt.Errorf("mark change utxos confirmed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkChangeUTXOsConfirmedByTxID(ctx context.Context, messageID int64, txid string, confirmHeight uint64) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE utxos
+		SET status = ?, confirm_height = ?, updated_at = ?
+		WHERE reserved_by_message_id = ? AND source = ? AND status = ? AND txid = ?
+	`, model.UTXOStatusAvailable, confirmHeight, time.Now().UTC().Format(time.RFC3339), messageID, model.UTXOSourceChange, model.UTXOStatusPending, txid)
+	if err != nil {
+		return fmt.Errorf("mark change utxos confirmed by txid: %w", err)
 	}
 	return nil
 }
