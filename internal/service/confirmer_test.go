@@ -931,6 +931,84 @@ func TestConfirmOnceTreatsCommitOutputsAlreadyInUTXOSetAsBroadcasted(t *testing.
 	}
 }
 
+func TestConfirmOnceTreatsRevealOutputsAlreadyInUTXOSetAsBroadcasted(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "reveal-already-utxo.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(1840586)
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "1839306:2")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := s.MarkMessageSignedWithReveal(ctx, messageID, "commit-hex", "reveal-hex", "revealtxid"); err != nil {
+		t.Fatalf("MarkMessageSignedWithReveal() error = %v", err)
+	}
+	if err := s.MarkMessageBroadcasted(ctx, messageID, "committxid"); err != nil {
+		t.Fatalf("MarkMessageBroadcasted() error = %v", err)
+	}
+	if err := s.MarkMessageConfirmed(ctx, messageID, height); err != nil {
+		t.Fatalf("MarkMessageConfirmed() error = %v", err)
+	}
+
+	var revealPushCount int
+	unisatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/indexer/local_pushtx":
+			var req struct {
+				TxHex string `json:"txHex"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.TxHex != "reveal-hex" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			revealPushCount++
+			_, _ = w.Write([]byte(`{"code":-1,"msg":"Transaction outputs already in utxo set","data":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer unisatServer.Close()
+
+	engine := Engine{
+		Store:         s,
+		UnisatOpenAPI: NewUnisatOpenAPIClient(unisatServer.URL, "test-key", time.Second),
+		Config:        config.Config{Runtime: config.RuntimeConfig{Mode: "unisat_open_api"}},
+	}
+
+	if err := engine.ConfirmOnce(ctx); err != nil {
+		t.Fatalf("ConfirmOnce() error = %v", err)
+	}
+	if revealPushCount != 1 {
+		t.Fatalf("reveal push count = %d, want 1", revealPushCount)
+	}
+
+	message, err := s.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatalf("GetMessage() error = %v", err)
+	}
+	if message.Status != model.MessageStatusDone {
+		t.Fatalf("message status = %q, want %q", message.Status, model.MessageStatusDone)
+	}
+	if message.RevealTxID != "reveal-hex" {
+		t.Fatalf("message reveal txid = %q, want reveal-hex", message.RevealTxID)
+	}
+	if message.RevealBroadcastAt == "" {
+		t.Fatalf("message reveal broadcast at should be set")
+	}
+	if message.RevealConfirmHeight != height {
+		t.Fatalf("message reveal confirm height = %d, want %d", message.RevealConfirmHeight, height)
+	}
+}
+
 func TestProgressOnceBacksOffAfterRevealBroadcastFailures(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "commit-confirm-check-backoff.db")
 	s, err := store.Open(dbPath)

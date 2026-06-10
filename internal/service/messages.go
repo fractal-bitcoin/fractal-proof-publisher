@@ -617,6 +617,18 @@ func (e *Engine) BroadcastReveal(ctx context.Context, parentMessageID int64) (st
 	}
 	if err != nil {
 		_ = e.Store.CreateBroadcastAttempt(ctx, message.ID, "reveal", err.Error())
+		if isTxOutputsAlreadyInUTXOSet(err) {
+			txid, txidErr := broadcastTxID(message.RevealRawTxHex)
+			if txidErr != nil {
+				e.LogMessagef(message, "reveal_broadcast_duplicate_txid_failed err=%v original_err=%v", txidErr, err)
+				return "", err
+			}
+			if markErr := e.Store.MarkRevealBroadcasted(ctx, message.ID, txid); markErr != nil {
+				return "", markErr
+			}
+			e.LogMessagef(message, "reveal_broadcast_already_in_utxo_set txid=%s", txid)
+			return txid, nil
+		}
 		e.LogMessagef(message, "reveal_broadcast_failed err=%v", err)
 		return "", err
 	}
