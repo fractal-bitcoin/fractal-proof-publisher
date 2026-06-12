@@ -85,13 +85,15 @@ func (e *Engine) RecoverOnce(ctx context.Context) error {
 	return e.ProgressOnce(ctx)
 }
 
+const defaultMaxReorgDepth uint64 = 30
+
 func (e *Engine) setLastScannedHeight(ctx context.Context, height uint64) error {
 	return e.Store.SetChainState(ctx, "last_scanned_height", strconv.FormatUint(height, 10))
 }
 
-func scanFloorHeight(tip uint64) uint64 {
-	if tip > 1000 {
-		return tip - 1000
+func subtractScanDepth(height, depth uint64) uint64 {
+	if height > depth {
+		return height - depth
 	}
 	return 0
 }
@@ -108,14 +110,18 @@ func maxScanHeight(values ...uint64) uint64 {
 
 func (e *Engine) initialScanStart(ctx context.Context, tip uint64, lastScannedText string) (uint64, error) {
 	configuredStart := e.Config.Scan.StartHeight
+	maxReorgDepth := e.Config.Scan.MaxReorgDepth
+	if maxReorgDepth == 0 {
+		maxReorgDepth = defaultMaxReorgDepth
+	}
 	if lastScannedText != "" || configuredStart != 0 {
-		start := maxScanHeight(scanFloorHeight(tip), configuredStart)
+		start := configuredStart
 		if lastScannedText != "" {
 			lastScanned, err := strconv.ParseUint(lastScannedText, 10, 64)
 			if err != nil {
 				return 0, fmt.Errorf("parse last_scanned_height: %w", err)
 			}
-			start = maxScanHeight(start, lastScanned)
+			start = maxScanHeight(start, subtractScanDepth(lastScanned, maxReorgDepth))
 		}
 		return start, nil
 	}
@@ -166,22 +172,10 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if previous.BlockHash != "" && previous.BlockHash != blockHash {
+		reorgDetected := previous.BlockHash != "" && previous.BlockHash != blockHash
+		if reorgDetected {
 			e.Logf("reorg_detected height=%d previous_hash=%s new_hash=%s", height, previous.BlockHash, blockHash)
 			if err := e.Store.MarkBlockOrphaned(ctx, height); err != nil {
-				return err
-			}
-			if err := e.Store.RollbackOrphanedUTXOsByHeight(ctx, height); err != nil {
-				return err
-			}
-			if err := e.Store.InvalidateOrphanedChangeUTXOsByHeight(ctx, height); err != nil {
-				return err
-			}
-			if err := e.Store.MarkMessagesFailedByHeight(ctx, height, "block hash changed due to reorg"); err != nil {
-				return err
-			}
-			indexerID, err = e.Store.GetChainState(ctx, "indexer_id")
-			if err != nil {
 				return err
 			}
 		}
@@ -212,16 +206,18 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		existingID, err := e.Store.FindMessageByHeightAndType(ctx, height, model.MessageTypeProve)
-		if err != nil {
-			return err
-		}
-		if existingID != 0 {
-			e.Logf("scan_skip_existing_prove height=%d existing_message_id=%d", height, existingID)
-			if err := e.setLastScannedHeight(ctx, height); err != nil {
+		if !reorgDetected {
+			existingID, err := e.Store.FindMessageByHeightAndType(ctx, height, model.MessageTypeProve)
+			if err != nil {
 				return err
 			}
-			continue
+			if existingID != 0 {
+				e.Logf("scan_skip_existing_prove height=%d existing_message_id=%d", height, existingID)
+				if err := e.setLastScannedHeight(ctx, height); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		if _, err := e.CreateProveSubmission(ctx, height, indexerID); err != nil {
 			if stateapi.IsRetryableHeightUnavailable(err) {

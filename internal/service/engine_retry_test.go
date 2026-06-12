@@ -111,6 +111,73 @@ func TestScanOnceRetriesWhenStateAPIIsTemporarilyBehind(t *testing.T) {
 	}
 }
 
+func TestScanOnceSkipsExistingProveWithoutStateAPIOnNonReorg(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "scan-skip-existing-non-reorg.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	if err := s.SetChainState(ctx, "indexer_id", "100:1"); err != nil {
+		t.Fatalf("SetChainState(indexer_id) error = %v", err)
+	}
+	if err := s.SetChainState(ctx, "last_scanned_height", "100"); err != nil {
+		t.Fatalf("SetChainState(last_scanned_height) error = %v", err)
+	}
+	if err := s.UpsertBlock(ctx, height, "block100", 539361536, 1, true, model.BlockStatusReady); err != nil {
+		t.Fatalf("UpsertBlock() error = %v", err)
+	}
+	messageID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if messageID == 0 {
+		t.Fatal("CreateMessage() id = 0")
+	}
+
+	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "getblockcount":
+			_, _ = w.Write([]byte(`{"result":100,"error":null}`))
+		case "getblockhash":
+			_, _ = w.Write([]byte(`{"result":"block100","error":null}`))
+		case "getblockheader":
+			_, _ = w.Write([]byte(`{"result":{"hash":"block100","height":100,"confirmations":1,"version":539361536},"error":null}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer rpcServer.Close()
+
+	stateCalls := 0
+	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stateCalls++
+		http.Error(w, "state api should not be called", http.StatusInternalServerError)
+	}))
+	defer stateServer.Close()
+
+	engine := Engine{
+		Store:    s,
+		RPC:      bitcoinrpc.New(rpcServer.URL, "", ""),
+		StateAPI: stateapi.New(stateServer.URL, "", time.Second, ""),
+		Config:   config.Config{Scan: config.ScanConfig{StartHeight: 100, TargetBlockVersion: 539361536, RequiredConfirmations: 1}},
+	}
+
+	if err := engine.ScanOnce(ctx); err != nil {
+		t.Fatalf("ScanOnce() error = %v", err)
+	}
+	if stateCalls != 0 {
+		t.Fatalf("state api calls = %d, want 0", stateCalls)
+	}
+}
+
 func TestScanOnceDoesNotAdvanceLastScannedWhileWaitingForRegister(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "scan-wait-register.db")
 	s, err := store.Open(dbPath)
@@ -212,8 +279,8 @@ func TestInitialScanStartUsesTipWhenUnconfiguredWithRegisterRecord(t *testing.T)
 	}
 }
 
-func TestInitialScanStartUsesMaxFloorDBAndConfig(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-max.db"))
+func TestInitialScanStartUsesConfiguredReorgDepth(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-depth.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -221,19 +288,19 @@ func TestInitialScanStartUsesMaxFloorDBAndConfig(t *testing.T) {
 
 	engine := Engine{
 		Store:  s,
-		Config: config.Config{Scan: config.ScanConfig{StartHeight: 1000}},
+		Config: config.Config{Scan: config.ScanConfig{StartHeight: 1000, MaxReorgDepth: 6}},
 	}
 	start, err := engine.initialScanStart(context.Background(), 45057, "43000")
 	if err != nil {
 		t.Fatalf("initialScanStart() error = %v", err)
 	}
-	if start != 44057 {
-		t.Fatalf("start = %d, want 44057", start)
+	if start != 42994 {
+		t.Fatalf("start = %d, want 42994", start)
 	}
 }
 
-func TestInitialScanStartUsesDBWhenGreaterThanFloorAndConfig(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-db.db"))
+func TestInitialScanStartDefaultsReorgDepthToThirty(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "scan-start-default-depth.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -247,7 +314,7 @@ func TestInitialScanStartUsesDBWhenGreaterThanFloorAndConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialScanStart() error = %v", err)
 	}
-	if start != 44500 {
-		t.Fatalf("start = %d, want 44500", start)
+	if start != 44470 {
+		t.Fatalf("start = %d, want 44470", start)
 	}
 }

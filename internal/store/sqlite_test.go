@@ -68,6 +68,36 @@ func TestGetLatestMessageByType(t *testing.T) {
 	}
 }
 
+func TestCreateProveMessageDedupeIncludesPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prove-payload-dedupe.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.DB.Close()
+
+	ctx := context.Background()
+	height := uint64(100)
+	firstID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload-a", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(first) error = %v", err)
+	}
+	samePayloadID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload-a", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(same payload) error = %v", err)
+	}
+	if samePayloadID != firstID {
+		t.Fatalf("same payload id = %d, want %d", samePayloadID, firstID)
+	}
+	differentPayloadID, err := s.CreateMessage(ctx, model.MessageTypeProve, "payload-b", &height, "100:1")
+	if err != nil {
+		t.Fatalf("CreateMessage(different payload) error = %v", err)
+	}
+	if differentPayloadID == firstID {
+		t.Fatalf("different payload reused id = %d", differentPayloadID)
+	}
+}
+
 func TestMarkMessageBroadcastedKeepsExistingChangeUTXOIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "change-align.db")
 	s, err := Open(path)

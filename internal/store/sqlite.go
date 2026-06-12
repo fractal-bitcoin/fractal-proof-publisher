@@ -256,13 +256,13 @@ func (s *Store) CreateMessage(ctx context.Context, messageType model.MessageType
 		var existingID int64
 		err := s.DB.QueryRowContext(ctx, `
 			SELECT id FROM messages
-			WHERE type = ? AND related_height = ? AND parent_message_id IS NULL AND status IN (?, ?, ?, ?, ?, ?)
+			WHERE type = ? AND related_height = ? AND payload_text = ? AND parent_message_id IS NULL AND status IN (?, ?, ?, ?, ?, ?)
 			ORDER BY id ASC LIMIT 1
-		`, messageType, *relatedHeight, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone).Scan(&existingID)
+		`, messageType, *relatedHeight, payload, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone).Scan(&existingID)
 		if err == nil {
 			return existingID, nil
 		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("query existing prove message: %w", err)
 		}
 	}
@@ -843,86 +843,6 @@ func (s *Store) MarkBlockOrphaned(ctx context.Context, height uint64) error {
 	`, model.BlockStatusFailed, time.Now().UTC().Format(time.RFC3339), height)
 	if err != nil {
 		return fmt.Errorf("mark block orphaned at %d: %w", height, err)
-	}
-	return nil
-}
-
-func (s *Store) MarkMessagesFailedByHeight(ctx context.Context, height uint64, reason string) error {
-	indexerID, err := s.GetChainState(ctx, "indexer_id")
-	if err != nil {
-		return err
-	}
-
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin mark messages failed tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if indexerID != "" {
-		var confirmedRegisterCount int
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(1) FROM messages
-			WHERE (related_height = ? OR confirm_height = ? OR reveal_confirm_height = ?) AND type = ? AND status IN (?, ?, ?) AND indexer_id = ?
-		`, height, height, height, model.MessageTypeRegister, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone, indexerID).Scan(&confirmedRegisterCount); err != nil {
-			return fmt.Errorf("count confirmed register messages at height %d: %w", height, err)
-		}
-		if confirmedRegisterCount > 0 {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM chain_state WHERE key = ?`, "indexer_id"); err != nil {
-				return fmt.Errorf("clear indexer_id at height %d: %w", height, err)
-			}
-		}
-	}
-
-	_, err = tx.ExecContext(ctx, `
-		UPDATE messages
-		SET status = ?,
-			failure_reason = ?,
-			confirm_height = CASE WHEN status IN (?, ?, ?) THEN 0 ELSE confirm_height END,
-			reveal_broadcast_at = NULL,
-			reveal_confirm_height = 0,
-			indexer_id = CASE WHEN type = ? AND status IN (?, ?, ?) THEN NULL ELSE indexer_id END,
-			updated_at = ?
-		WHERE parent_message_id IS NULL
-		  AND (related_height = ? OR confirm_height = ? OR reveal_confirm_height = ?)
-		  AND status IN (?, ?, ?, ?, ?, ?)
-	`, model.MessageStatusFailed, reason, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageTypeRegister, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone, time.Now().UTC().Format(time.RFC3339), height, height, height, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone)
-	if err != nil {
-		return fmt.Errorf("mark messages failed at height %d: %w", height, err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit mark messages failed tx: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) RollbackOrphanedUTXOsByHeight(ctx context.Context, height uint64) error {
-	_, err := s.DB.ExecContext(ctx, `
-		UPDATE utxos
-		SET status = ?, reserved_by_message_id = NULL, reserved_at = NULL, spent_by_txid = NULL, confirm_height = 0, updated_at = ?
-		WHERE reserved_by_message_id IN (
-			SELECT id FROM messages WHERE parent_message_id IS NULL AND (related_height = ? OR confirm_height = ? OR reveal_confirm_height = ?) AND status IN (?, ?, ?, ?, ?, ?)
-		) AND status IN (?, ?)
-	`, model.UTXOStatusAvailable, time.Now().UTC().Format(time.RFC3339), height, height, height, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone, model.UTXOStatusReserved, model.UTXOStatusSpentPending)
-	if err != nil {
-		return fmt.Errorf("rollback orphaned utxos at height %d: %w", height, err)
-	}
-	return nil
-}
-
-func (s *Store) InvalidateOrphanedChangeUTXOsByHeight(ctx context.Context, height uint64) error {
-	_, err := s.DB.ExecContext(ctx, `
-		UPDATE utxos
-		SET status = ?, spent_by_txid = NULL, confirm_height = 0, updated_at = ?
-			WHERE source = ?
-			  AND reserved_by_message_id IN (
-				SELECT id FROM messages WHERE parent_message_id IS NULL AND (related_height = ? OR confirm_height = ? OR reveal_confirm_height = ?) AND status IN (?, ?, ?, ?, ?, ?)
-			  )
-			  AND status IN (?, ?, ?, ?)
-		`, model.UTXOStatusInvalid, time.Now().UTC().Format(time.RFC3339), model.UTXOSourceChange, height, height, height, model.MessageStatusBuilding, model.MessageStatusCommitSigned, model.MessageStatusCommitSent, model.MessageStatusCommitConfirmed, model.MessageStatusRevealSent, model.MessageStatusDone, model.UTXOStatusPending, model.UTXOStatusAvailable, model.UTXOStatusSpentPending, model.UTXOStatusSpentConfirmed)
-	if err != nil {
-		return fmt.Errorf("invalidate orphaned change utxos at height %d: %w", height, err)
 	}
 	return nil
 }

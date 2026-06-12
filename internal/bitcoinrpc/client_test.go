@@ -26,7 +26,7 @@ func TestSendRawTransactionErrorIncludesRequest(t *testing.T) {
 	if !strings.Contains(errorText, `"method":"sendrawtransaction"`) {
 		t.Fatalf("error = %q, want sendrawtransaction method", errorText)
 	}
-	if !strings.Contains(errorText, `"params":["deadbeef",0,1]`) {
+	if !strings.Contains(errorText, `"params":["deadbeef",0.1,1]`) {
 		t.Fatalf("error = %q, want raw tx, maxfeerate, and maxburnamount params", errorText)
 	}
 }
